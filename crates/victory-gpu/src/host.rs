@@ -1258,6 +1258,17 @@ pub(crate) fn dred_on() -> bool {
 /// budget buffers, a run late).
 static MESH_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// The lists' indirect-work budgets since the last frame line: the most one
+/// list had spent when it was next used (of 2^27), and the records the
+/// budget emptied in all (a run late, as above).
+static BUDGET_USE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Records that cost an eighth of a list's budget or more since the last
+/// frame line, by (kind, pipeline tag) of the last one a list saw: how many
+/// its lists had, and that record (kind, tag, the three words asked, cost).
+static BIG_RECORDS: std::sync::Mutex<std::collections::BTreeMap<(u32, u32), (u64, [u32; 6])>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
 /// Whether each list of a submission runs and is timed on its own, slow
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
 /// builds; the commands are noted with `VICTORY_D3D12_DRED` on).
@@ -5044,7 +5055,17 @@ impl HostList {
                 let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
                 MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
                 MESH_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
-                for k in 0..3 {
+                BUDGET_USE[0].fetch_max(u64::from(words.read_volatile()), Ordering::Relaxed);
+                BUDGET_USE[1].fetch_add(u64::from(words.add(3).read_volatile()), Ordering::Relaxed);
+                let big = words.add(4).read_volatile();
+                if big > 0 {
+                    let last: [u32; 6] = std::array::from_fn(|k| words.add(5 + k).read_volatile());
+                    let mut seen = BIG_RECORDS.lock().unwrap_or_else(|e| e.into_inner());
+                    let entry = seen.entry((last[0], last[1])).or_insert((0, last));
+                    entry.0 += u64::from(big);
+                    entry.1 = last;
+                }
+                for k in 0..11 {
                     words.add(k).write_volatile(0);
                 }
             })));
@@ -5720,6 +5741,23 @@ impl Meter {
         tracing::info!(
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
         );
+        let budget_most = BUDGET_USE[0].swap(0, Ordering::Relaxed);
+        let budget_emptied = BUDGET_USE[1].swap(0, Ordering::Relaxed) as f64 / frames;
+        tracing::info!(
+            "indirect budgets: the most one list spent {budget_most} of 134217728, {budget_emptied:.1} records emptied by a spent budget per frame"
+        );
+        for ((kind, tag), (n, last)) in std::mem::take(&mut *BIG_RECORDS.lock().unwrap_or_else(|e| e.into_inner())) {
+            tracing::info!(
+                "indirect records costing an eighth of a budget or more: {:.1} per frame in lists whose last was kind {} (window {}) of pipeline {tag:08x}: asked {:#x} {:#x} {:#x}, cost {}",
+                n as f64 / frames,
+                kind & 0xff,
+                kind >> 8,
+                last[2],
+                last[3],
+                last[4],
+                last[5]
+            );
+        }
         late_line(frames);
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);

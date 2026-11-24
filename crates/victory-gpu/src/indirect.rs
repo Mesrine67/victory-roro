@@ -28,7 +28,7 @@ use windows::core::s;
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
+#define RS "RootConstants(num32BitConstants=7, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) {
     uint kind;
     uint stride;
@@ -39,6 +39,8 @@ cbuffer Record : register(b0) {
     // run is left empty and costs nothing.
     uint has_count;
     uint count_offset;
+    // Diagnostics: which pipeline's records these are.
+    uint tag;
 };
 ByteAddressBuffer src_args : register(t0);
 ByteAddressBuffer count_buf : register(t1);
@@ -63,6 +65,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     uint cost;
     uint2 draw_counts = uint2(0, 0);
     uint3 groups = uint3(0, 0, 0);
+    uint3 raw = src_args.Load3(src_at);
     if (kind <= 1) {
         // Draws: vertex or index count, then instances.
         uint2 asked = src_args.Load2(src_at);
@@ -99,6 +102,16 @@ void main(uint3 id : SV_DispatchThreadID) {
         cost = g.x * g.y * g.z * 128u;
         groups = g;
     }
+    // Diagnostics: records that cost an eighth of the budget or more, and
+    // the last one of them (kind, tag, what it asked for, its cost).
+    if (cost >= (1u << 24)) {
+        uint big;
+        budget.InterlockedAdd(16, 1u, big);
+        budget.Store(20, kind | (ahead ? 0x100u : 0u));
+        budget.Store(24, tag);
+        budget.Store3(28, raw);
+        budget.Store(40, cost);
+    }
     bool over = false;
     if (cost > 0) {
         uint before;
@@ -112,6 +125,12 @@ void main(uint3 id : SV_DispatchThreadID) {
             before = prev;
         }
         over = before >= BUDGET || BUDGET - before < cost;
+        // Diagnostics: records the budget emptied, in the word after the
+        // mesh counts.
+        if (over) {
+            uint emptied;
+            budget.InterlockedAdd(12, 1u, emptied);
+        }
     }
     if (kind <= 1) {
         if (over) {
@@ -209,6 +228,17 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
         })?;
         Ok(Clamp { root, pso })
     }
+}
+
+thread_local! {
+    /// Diagnostics: the tag the next clamps recorded by this thread carry
+    /// (the first eight digits of their pipeline's first shader hash).
+    static TAG: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Names the pipeline whose records this thread clamps next.
+pub(crate) fn tag(of: u32) {
+    TAG.with(|t| t.set(of));
 }
 
 /// Minimum record byte stride for a supported PC indirect argument `kind`.
@@ -343,7 +373,15 @@ fn record_clamp_as(
         }
         None => (src_gpu, 0u32, 0u32),
     };
-    let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1), count_offset];
+    let constants = [
+        kind,
+        stride,
+        records,
+        args_offset,
+        has_count | (u32::from(ahead) << 1),
+        count_offset,
+        TAG.with(std::cell::Cell::get),
+    ];
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
@@ -379,7 +417,7 @@ fn record_clamp_as(
         if records > 0 {
             l.SetComputeRootSignature(&c.root);
             l.SetPipelineState(&c.pso);
-            l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+            l.SetComputeRoot32BitConstants(0, 7, constants.as_ptr().cast(), 0);
             l.SetComputeRootShaderResourceView(1, src_gpu);
             l.SetComputeRootShaderResourceView(2, count_gpu);
             l.SetComputeRootUnorderedAccessView(3, dst_gpu);
