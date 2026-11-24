@@ -180,6 +180,8 @@ fn create() -> windows::core::Result<Host> {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
+        } else if let Some(adapter) = named_adapter() {
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         } else {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
@@ -223,6 +225,46 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
         })
+    }
+}
+
+/// `VICTORY_ADAPTER=<part of the adapter's name>` picks the host GPU on a
+/// machine with several (e.g. the one that does not drive the main display,
+/// so a GPU hang resets a different card). Every hardware adapter is logged
+/// so the choice is visible; no match falls back to the default adapter.
+fn named_adapter() -> Option<IDXGIAdapter1> {
+    let wanted = std::env::var("VICTORY_ADAPTER").ok()?.trim().to_lowercase();
+    if wanted.is_empty() {
+        return None;
+    }
+    // SAFETY: plain DXGI adapter queries.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let mut found = None;
+        let mut index = 0;
+        while let Ok(adapter) = factory.EnumAdapters1(index) {
+            index += 1;
+            let Ok(desc) = adapter.GetDesc1() else { continue };
+            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                continue;
+            }
+            let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+            let name = String::from_utf16_lossy(&desc.Description[..len]);
+            let matches = name.to_lowercase().contains(&wanted);
+            tracing::info!(
+                adapter = %name,
+                vram_mb = desc.DedicatedVideoMemory / (1 << 20),
+                chosen = matches && found.is_none(),
+                "host adapter"
+            );
+            if matches && found.is_none() {
+                found = Some(adapter);
+            }
+        }
+        if found.is_none() {
+            tracing::warn!(wanted = %wanted, "VICTORY_ADAPTER matched no adapter; using the default");
+        }
+        found
     }
 }
 
