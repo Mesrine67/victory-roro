@@ -66,7 +66,14 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// Checks left at which a guarded texture is hashed whatever the guards
+    /// say, because its hash found a change they did not report
+    /// ([`Staging::unseen_write`]).
+    unseen: u32,
 }
+
+/// Movie-like textures found so far ([`Staging::unseen_write`]), for the log.
+static UNSEEN_FOUND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 // SAFETY: the staging mapping is written only at submission, under
 // `last`'s lock; the title memory is only read.
@@ -646,7 +653,21 @@ impl Staging {
         // the hash, which is taken every eighth frame only, by the
         // texture's address, so the textures take turns.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
+        //
+        //
+        // A movie's pictures are written through another view at every
+        // frame, and on the hash's turn alone they were read once in eight
+        // frames. The intro movies keep three pictures of three planes
+        // (3840x2160 and two of 1920x1080, 36 MB in all) and show them in
+        // turn, so what was shown jumped between pictures read at different
+        // moments: at 30 fps runs 18 and 19 hashed 1.6 MB a frame, all of
+        // it changed, and recorded under half an upload a frame. A texture
+        // whose hash finds a change the guards did not report is hashed at
+        // its next checks too ([`Staging::unseen_write`]): 12.7 MB a frame
+        // then, three uploads, 6 ms, and the movie runs evenly.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        // Whether the guards reported no write since the last check.
+        let mut silent = false;
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
@@ -654,10 +675,74 @@ impl Staging {
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
-            if unwritten && !turn {
+            if unwritten && !turn && last.unseen == 0 {
                 return 0;
             }
+            silent = unwritten;
         }
+        let before = last.hash;
+        let read = self.refresh_hashed(last, size);
+        if silent && read != 0 {
+            self.unseen_write(last, last.hash != before);
+        }
+        read
+    }
+
+    /// After a hash of a guarded texture that the guards reported no write
+    /// to: `changed` says the hash found one all the same (a write through
+    /// another view of the same pages, which the guards cannot see).
+    ///
+    /// The first such write has the texture hashed at its next two checks
+    /// instead of at its turn; a second one within those marks it as
+    /// written every frame (a movie's picture), and it is hashed at every
+    /// check until thirty of them in a row find it as it was. Textures that
+    /// change once (streamed in) cost two hashes more than before.
+    ///
+    /// shortcut: block-compressed textures are left to their turn: they
+    /// are streamed, not drawn into (30-100 MB of them change in a frame
+    /// while the world streams in, runs 19 and 20, and each would be
+    /// hashed twice more).
+    /// `VICTORY_TEXTURE_UNSEEN=0` leaves every texture to its turn, as
+    /// before.
+    fn unseen_write(&self, last: &mut Last, changed: bool) {
+        const AGAIN: u32 = 2;
+        const MOVIE: u32 = 30;
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if self.layout.desc.block != 1
+            || !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_UNSEEN").is_none_or(|v| v != "0"))
+        {
+            return;
+        }
+        if !changed {
+            last.unseen = last.unseen.saturating_sub(1);
+            return;
+        }
+        if last.unseen == 0 {
+            last.unseen = AGAIN;
+            return;
+        }
+        if last.unseen <= AGAIN {
+            let found = UNSEEN_FOUND.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if found <= 64 {
+                let d = &self.layout.desc;
+                tracing::info!(
+                    memory = ?self.memory,
+                    width = d.width,
+                    height = d.height,
+                    element_bytes = d.element_bytes,
+                    megabytes = format_args!("{:.2}", self.layout.size as f64 / 1048576.0),
+                    found,
+                    "a texture is written every frame where the guards do not see it (a movie's picture): \
+                     hashed at every check while it keeps changing (VICTORY_TEXTURE_UNSEEN=0: at its turn only)"
+                );
+            }
+        }
+        last.unseen = MOVIE;
+    }
+
+    /// The rest of a refresh: the texture's memory is read and hashed, and
+    /// detiled if the hash differs from the last. Returns the bytes read.
+    fn refresh_hashed(&self, last: &mut Last, size: usize) -> usize {
         // From here on the texture's memory may be read in place. Held until
         // that read is done: the runtime changes what title memory shows
         // only with this taken alone, so what `committed` finds mapped
