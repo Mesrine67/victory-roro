@@ -186,6 +186,23 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        // The host's wave widths: a compute shader that declares the
+        // console's 64-lane waves is refused where the maximum is 32.
+        let mut waves = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        if device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut waves).cast(),
+                size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS1>() as u32,
+            )
+            .is_ok()
+        {
+            tracing::info!(
+                min = waves.WaveLaneCountMin,
+                max = waves.WaveLaneCountMax,
+                "host wave lanes"
+            );
+        }
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();

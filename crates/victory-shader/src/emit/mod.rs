@@ -156,6 +156,9 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u8>,
+    /// Compute: the wave size the shader requires of the host (`WaveSize`),
+    /// if any. A host whose waves cannot be that wide refuses the pipeline.
+    pub wave_size: Option<u32>,
 }
 
 impl HostShader {
@@ -308,6 +311,7 @@ pub fn emit(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        wave_size: l.wave_size,
     })
 }
 

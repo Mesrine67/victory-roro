@@ -37,6 +37,8 @@ pub(crate) struct Lowered {
     pub root_srvs: Vec<u8>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
+    /// Compute: the wave size the program declares it needs, if any.
+    pub wave_size: Option<u32>,
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
@@ -902,8 +904,10 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
+        let wave_size = self.s.wave_size;
         Ok(Lowered {
             cmp_samplers,
+            wave_size,
             root_cbvs,
             root_srvs,
             #[cfg(test)]
