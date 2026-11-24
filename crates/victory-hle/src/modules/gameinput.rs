@@ -1152,10 +1152,22 @@ mod host {
             // to the pad (Grand Theft Auto VI's start screen) saw nothing.
             #[cfg(feature = "diagnostics")]
             if slot == 0 {
-                for vk in scripted() {
+                let held = scripted();
+                for &vk in &held {
                     if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
                         pad.buttons |= button;
                     }
+                }
+                // The stand-in pad's stick keys push the real pad's sticks
+                // too, so a script can walk and turn the camera.
+                let on = |vk: u8| if held.contains(&vk) { 1.0_f32 } else { 0.0 };
+                let (lx, ly) = (on(b'D') - on(b'A'), on(b'W') - on(b'S'));
+                let (rx, ry) = (on(b'L') - on(b'J'), on(b'I') - on(b'K'));
+                if lx != 0.0 || ly != 0.0 {
+                    (pad.left_x, pad.left_y) = (lx, ly);
+                }
+                if rx != 0.0 || ry != 0.0 {
+                    (pad.right_x, pad.right_y) = (rx, ry);
                 }
             }
             Some(pad)
@@ -1199,12 +1211,13 @@ mod host {
     }
 
     /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts, with or without focus. A key is a
+    /// 0.2 s that long after input starts, with or without focus;
+    /// `<seconds>+<hold seconds>:<key>` holds it for longer. A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
+        static SCRIPT: LazyLock<(Instant, Vec<(Duration, Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
@@ -1222,8 +1235,13 @@ mod host {
                     }
                     _ => return None,
                 };
+                let (at, hold) = match at.split_once('+') {
+                    Some((at, hold)) => (at, hold.trim().parse().ok()?),
+                    None => (at, 0.2),
+                };
                 Some((
                     Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
+                    Duration::try_from_secs_f64(hold).ok()?,
                     vk,
                 ))
             });
@@ -1232,8 +1250,8 @@ mod host {
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
         keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
-            .map(|&(_, vk)| vk)
+            .filter(|&&(at, hold, _)| (at..at + hold).contains(&now))
+            .map(|&(_, _, vk)| vk)
             .collect()
     }
 
