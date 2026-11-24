@@ -529,6 +529,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
         wave_size: None,
+        wave_why: 0,
     }
 }
 

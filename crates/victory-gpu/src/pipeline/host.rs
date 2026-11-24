@@ -435,11 +435,13 @@ impl HostPipeline {
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
-                    let wave_size = stages
+                    let host_shader = stages
                         .first()
                         .and_then(|(s, _)| s.translated())
-                        .and_then(|t| t.host.wave_size);
-                    tracing::warn!(error = %e, ?shaders, ?wave_size, "host pipeline refused");
+                        .map(|t| &t.host);
+                    let wave_size = host_shader.and_then(|h| h.wave_size);
+                    let wave_why = host_shader.map_or(0, |h| h.wave_why);
+                    tracing::warn!(error = %e, ?shaders, ?wave_size, wave_why = %format_args!("{wave_why:#x}"), "host pipeline refused");
                     host.log_messages();
                     return None;
                 }

@@ -159,6 +159,10 @@ pub struct HostShader {
     /// Compute: the wave size the shader requires of the host (`WaveSize`),
     /// if any. A host whose waves cannot be that wide refuses the pipeline.
     pub wave_size: Option<u32>,
+    /// Diagnostics: why (bits: swizzle, permute, mbcnt, lane read/write,
+    /// DPP, masks read as data, 0x40 masks held as numbers, 0x80 LDS in a
+    /// one-wave group; the group's thread count from bit 8).
+    pub wave_why: u32,
 }
 
 impl HostShader {
@@ -312,6 +316,7 @@ pub fn emit(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         wave_size: l.wave_size,
+        wave_why: l.wave_why,
     })
 }
 

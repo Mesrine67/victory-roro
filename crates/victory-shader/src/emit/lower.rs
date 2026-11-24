@@ -39,6 +39,8 @@ pub(crate) struct Lowered {
     pub samplers: Vec<[u32; 4]>,
     /// Compute: the wave size the program declares it needs, if any.
     pub wave_size: Option<u32>,
+    /// Diagnostics: why it needs it (see `wave_why` in `Lower::new`).
+    pub wave_why: u32,
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
@@ -191,6 +193,8 @@ struct Lower<'a> {
     /// Compute code that reads other lanes: thread ids follow the host
     /// lanes, so lane n is console lane n.
     console_lanes: bool,
+    /// Diagnostics: why the program needs the console's lanes.
+    wave_why: u32,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
@@ -362,21 +366,30 @@ impl<'a> Lower<'a> {
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
         let mut console_lanes = false;
+        let mut wave_why = 0u32;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
-            console_lanes = insts().any(|i| {
+            // Diagnostics: which of these a program has, one bit each (and
+            // 0x40 masks as numbers, 0x80 one-wave LDS, threads from bit 8).
+            for i in insts() {
                 let n = i.name();
-                n.starts_with("ds_swizzle")
-                    || n.contains("permute")
-                    || n.starts_with("v_mbcnt")
-                    || matches!(n, "v_readlane_b32" | "v_writelane_b32")
-                    || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
-                    || reads_mask_as_data(x.st, i)
-            }) || {
+                let bits = [
+                    n.starts_with("ds_swizzle"),
+                    n.contains("permute"),
+                    n.starts_with("v_mbcnt"),
+                    matches!(n, "v_readlane_b32" | "v_writelane_b32"),
+                    matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some()),
+                    reads_mask_as_data(x.st, i),
+                ];
+                for (k, on) in bits.into_iter().enumerate() {
+                    wave_why |= u32::from(on) << k;
+                }
+            }
+            console_lanes = wave_why != 0 || {
                 // Masks held as numbers or constant lane sets: the lane
                 // tests its own bit by its console lane.
                 let whens = x.st.exits.iter().filter_map(|e| match *e {
@@ -402,6 +415,13 @@ impl<'a> Lower<'a> {
             };
             let wave = if x.native.wave64 { 64 } else { 32 };
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
+            if console_lanes && wave_why == 0 {
+                wave_why |= 0x40;
+            }
+            if one_wave && s.lds_dwords > 0 {
+                wave_why |= 0x80;
+            }
+            wave_why |= cs.threads.iter().product::<u32>() << 8;
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
             }
@@ -488,6 +508,7 @@ impl<'a> Lower<'a> {
             writes_uavs,
             src0: None,
             console_lanes,
+            wave_why,
             flat: None,
             no_barrier,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
@@ -908,6 +929,7 @@ impl<'a> Lower<'a> {
         Ok(Lowered {
             cmp_samplers,
             wave_size,
+            wave_why: self.wave_why,
             root_cbvs,
             root_srvs,
             #[cfg(test)]
