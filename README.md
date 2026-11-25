@@ -7,6 +7,7 @@ It covers how we bridged the console's unified CPU/GPU memory to PC heaps and GP
 **What is not here:** game data of any kind (no assets, shaders, addresses or dumps), console SDK material, or our loader's source code. The design is described, not shipped.
 
 ## Start here
+- **The whole write-up as one page:** [xbox-memory-translation-notes](https://github.com/TPepperoni666/xbox-memory-translation-notes).
 - **The short version:** [docs/00-about.md](docs/00-about.md), section 0.4 ("Short version").
 - **If you are starting a Series X translator:** read [14-series-x.md](docs/14-series-x.md) and [15-day-one.md](docs/15-day-one.md), then come back to the mechanisms.
 
