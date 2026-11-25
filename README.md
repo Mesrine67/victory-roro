@@ -1,253 +1,71 @@
-# VIctory fork (work in progress)
+# victory — rorodev6's build
 
-## victory-amd
+A Windows runtime for **an Xbox Series X|S title**, run from game files you own yourself. This branch is maintained by
+**[rorodev6](https://github.com/rorodev6)**. Since 2026-11-25 it is based on **shadowdog00's** build, which runs the
+title as the smaller console (Xbox Series S) and is about three times faster than the previous `main`. It is tested on an
+**AMD Radeon RX 6700 XT (12 GB)**.
 
-This copy is a fork of
-[fxceless/victory-fork](https://github.com/fxceless/victory-fork), itself a fork
-of [VIctory](https://github.com/Marvisak/VIctory). It adds fixes found while
-running on an AMD card, tested on one machine only: Windows 11, Radeon RX 7800 XT
-16 GB (driver 32.0.32029.2010), Ryzen 5 7500F, 32 GB RAM.
+The title's original x86-64 code runs unchanged inside the process; the runtime provides the Xbox/GDK platform beneath it
+and translates the console's GPU data and shaders (D3D12.X / GFX10 → D3D12 / DXIL).
 
-State on that machine (2026-11-25, Series X profile): the prologue's cutscene and
-the first room are drawn, with the player moving, at 2 to 3 frames per second.
-Runs of 8 minutes mostly end without a device loss; one ended with
-`DXGI_ERROR_DEVICE_HUNG` after about 5 and a half minutes, cause unknown. Lamps
-were dark in one run. The room's walls were missing in two others, one before a fix
-that is here (the early pipeline list) and one with changes that are not. Ray-traced
-light does not run.
+> No game data is included or distributed here. You need your own copy of the game.
 
-What it changes over `victory-fork` (each is explained in a comment where it is):
+## What this build is
 
-- Texture views are told apart by the memory their mips really take, so textures
-  streamed in part are not taken for one another and are uploaded from their first
-  mip that is there.
-- Views of placed textures the host lost sight of are put back
-  (`VICTORY_TEXTURE_SWEEP`).
-- Dispatches of more than 65,535 groups are made in two parts (the final gather at
-  2560x1440 asks for 115,200).
-- DirectStorage requests read their page array when they run, and wait for it.
-- The list of pipelines to make early keeps what earlier runs listed, and compute
-  pipelines get their own waiting time while a world loads.
-- View indices past the host heap are clamped on AMD too.
-- Programs that stop the AMD driver's compiler, or take it minutes and tens of GB,
-  are left out (ray-tracing resolves).
-- Diagnostics: `VICTORY_NULL_MAGENTA`, `victory warm`, more captures.
+| Part | Source |
+|------|--------|
+| Base runtime | [Marvisak/VIctory](https://github.com/Marvisak/VIctory) |
+| Fork line | [fxceless/victory-gta6](https://github.com/fxceless/victory-gta6) |
+| Series S mode, upscaler stand-in, pooled GPU memory, faster card-copy hashing | [shadowdog00/vi-pc-combo](https://github.com/shadowdog00/vi-pc-combo), branch `victory/main` (`692519e`) |
+| Shader fixes carried over | [uiliannn/VItoriaBr](https://github.com/uiliannn/VItoriaBr) (see below) |
+| FPS counter, shader fixes ported, AMD preset, `play.ps1`, `AGENTS.md` | **rorodev6** (this branch) |
 
-Parts of it were prompted by pull requests and issues of VIctory and victory-fork;
-the code was written anew. Developed with [Claude Code](https://claude.com/claude-code).
+The previous `main` (VItoriaBr + fxceless + low textures, ~3 fps) is kept on the branch `full-build-2026-11-25`.
 
-A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
-compatibility layer that runs an Xbox Series title natively on Windows from
-files the user supplies. This fork follows upstream
-`main` and adds fixes aimed at one goal: getting the game's world to render
-correctly and playably on one particular PC.
+### rorodev6's changes on top of shadowdog's build
 
-**This repository contains no game files, code or assets.** You need your own
-copy of the game. It is not affiliated with or endorsed by the game's
-developer or publisher.
+- **FPS counter** in the top-left corner of the game window (`crates/victory-gpu/src/fps_overlay.rs`). It is a separate
+  transparent window, so it costs no frame time. `VICTORY_FPS_OVERLAY=0` turns it off.
+- **Shader translator fixes ported from VItoriaBr**, for programs the game uses that did not translate before:
+  - `v_cvt_f32_f64` (water volumetrics compute shaders), VItoriaBr `3052431`;
+  - `v_permlane16_b32` / `v_permlanex16_b32` (water transmittance), from VItoriaBr `31714de`;
+  - buffer-view addresses chosen by a computed heap index (`SLOT_VIEWS`), VItoriaBr `b62bbc0`.
+- `play.ps1` with shadowdog's preset, Series S by default.
 
-## Credits
-
-- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
-  contributors is the base of everything here: the loader, the runtime
-  services, the Direct3D 12 back end and the shader recompiler. Licensed
-  GPL-3.0-or-later; so is this fork. Upstream's history is kept intact below
-  the single commit that carries this fork's changes.
-- **[XCL](https://github.com/ivall/xcl)** by ivall and its contributors
-  (GPL-2.0-only) was used as a reference for how the same title behaves under
-  another layer. Fixes inspired by it were written anew in VIctory's code.
-- This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
-
-## Status of this fork (2026-11-25)
-
-**Not playable yet: 2.5 to 4 frames per second, and shadowed areas are black.**
-Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
-32 GB RAM. The Series X profile is used throughout.
-
-| Stage | State in this fork |
-|-------|--------------------|
-| Boot, menus, start screen | works, 30 fps (as upstream) |
-| Opening cutscene | plays from start to finish, in order, lit: title cards, credits cards, night and dusk shots |
-| Saves | the game autosaves a checkpoint and loads it again |
-| First gameplay scene (the prologue) | renders: characters, textures, sky, sunlit exterior; HUD, pause menu and pad input work |
-| Light in shadow | missing: the game's ray-traced bounce light and ray-traced lamp and sun shadows do not run yet, so anything the sun does not hit directly is black |
-| Frame rate in the world | 2-4 fps: 420-450 ms per frame by default, 240-350 ms with the newer switches (`VICTORY_RELAY=2`, or `VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1 VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_CARD_BUFFERS_MB=1024`); it started at 3-6 seconds per frame |
-| Stability | no driver hang or device loss in normal runs (a hang introduced by the wave64 update was found and fixed: its barrier form for 64-lane programs is now off unless `VICTORY_WAVE_WIDE=1`) |
-
-### What this fork changed (summary)
-
-Rendering:
-- Meshlet culling read its scene buffers as the wrong kind of view, so the world drew almost nothing; fixed.
-- Per-draw descriptor tables could run out, after which draws used slots never made for them and the card hung; fixed.
-- Light packed by the game's compute shaders was read back through empty copies (sky, probes, fog); fixed for every mip level and layer.
-- The fog reconstruction, shadow-mask, hair, blend-shape skinning, fire and several material programs did not translate; fixed.
-- Gathers at a named mip level (with and without an offset) read level 0; fixed.
-- Implicit-level samples outside pixel shaders produced invalid DXIL in 730 compute programs; fixed.
-- Rectangle lists, depth and stencil twins for depth textures written by compute, texture read-backs.
-- Ray tracing, in progress and off by default: the game's own structure-builder programs translate, title memory can be read by raw address from shaders, the hardware ray/box and ray/triangle test is emulated in DXIL (checked against a reference on the GPU), and 59 of the 64 trace programs translate. Nothing is lit by it yet. See [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md).
-
-Speed and memory:
-- Waits for memory values, write-watch queries and page queries no longer walk page tables per call.
-- Large title buffers get a copy in card memory, with shader writes found by hashing on the card.
-- Submissions can be sent ahead of the wait for the card (`VICTORY_LATE_WAIT`), with a relay thread that lands results as the card finishes (`VICTORY_RELAY`): in a first five-minute run the card's idle time behind the submitting thread fell from about 136 to 30 ms per frame.
-- Title memory can be opened as a graphics heap so that buffers are used in place instead of copied (`VICTORY_INPLACE`, first stage only; a probe confirmed the approach on the test GPU).
-- The bindless texture queue no longer uploads stale views; the view table no longer grows without bound; the pipeline library is mapped instead of read into memory.
-- An intermittent device loss was traced to the pipeline library file being replaced while mapped; fixed.
-
-- Translated shaders get clean-up passes over the finished module (dead code, constant folding, reuse of values, branch facts); the pack's host instruction count falls by about 43 %, worth about 20 ms of GPU time per frame on the test machine (`VICTORY_SHADER_OPT=0` turns them off).
-
-Most of the newer speed changes sit behind environment switches that are off
-by default (`VICTORY_LATE_WAIT`, `VICTORY_RELAY`, `VICTORY_WIDE_BACK`,
-`VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_INPLACE`, `VICTORY_BVH_BUILDER`, ...).
-Each is described in a comment where it is read.
-
-### Known problems
-
-- Everything in shadow is black (see above).
-- The interior of the first gameplay room is sometimes not drawn after the cutscene hands over to gameplay.
-- Around 24 GB of memory is in use during play.
-- A few style lints are switched off for this fork in the workspace `Cargo.toml` until the newer code is tidied.
-- Many changes here are specific to this title and this GPU, and some are marked `shortcut:` in the code where they approximate what the console does.
-
-Everything below this line is upstream VIctory's own README, unchanged; its
-status section describes upstream, not this fork.
-
----
-
-# VIctory
-
-Runs the title (Xbox Series X|S) natively on Windows, from files
-the user supplies.
-
-The title's x86-64 code runs unchanged inside our process; VIctory supplies
-the platform underneath it and converts the title's data, ahead of time where
-it can and on first use where it must (shaders). See
-[docs/architecture.md](docs/architecture.md).
-
-## Status (2026-11-23)
-
-**Not playable yet.** The title boots, runs its menus at its own 30 fps and
-loads the world, where rendering fails.
+## Status (2026-11-25, RX 6700 XT 12 GB, Ryzen, 32 GB RAM)
 
 | Stage | State |
 |-------|-------|
-| Boot, first-boot screens (accessibility, language, settings, legal) | works, 30 fps |
-| Intro video with sound | works |
-| Start screen, profile and saves | works |
-| Loading into the world (about 50 s) | works |
-| The world (first mission's intro) | reached and runs with indirect draws; its title card renders, the scene after it is still dark; 0.5-1.8 s per frame |
+| Boot, menus, intro video | ✅ Works |
+| Opening cutscene, prologue | 🟡 **7-9 fps** (113-141 ms a frame), up from ~3 fps |
+| Characters | ✅ Bodies, faces and hair drawn |
+| Textures | 🟡 Some walls, posters and wire mesh differ from launch to launch |
+| Ray tracing | ⚪ Off (its structure builder is not emulated) |
 
-Tested on one machine: Windows 11, AMD RX 6700 XT.
+Where a frame goes on the RX 6700 XT: about 70-80 ms preparing it (copying the title's memory to the card), 60-75 ms
+copying results back (partly overlapping), and only 22-40 ms of GPU work. The single submitting thread is the limit,
+not the GPU.
 
-> **Warning.** Entering the world on a real GPU can currently hang it, and
-> Windows then resets the display driver (every monitor goes black for a
-> moment). To look further, use a diagnostics build with
-> `VICTORY_D3D12_WARP=1`, which renders on the software adapter.
+## Easiest way: ask an AI assistant
 
-What each part does today and what it still needs:
+Open this folder in an AI coding assistant (Claude Code, Cursor, Copilot, …) and say *"set this up and launch the
+game"*, or *"look at my err.txt"* after a crash. `AGENTS.md` tells it how to build, run and read the logs.
 
-| Subsystem | Today | Needs |
-|-----------|-------|-------|
-| Loader | Runs the title's executable and its DLLs in our process; crash reports name the faulting code and are kept in `crashes.log` | – |
-| Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog | Speech is silent; the dialog and relaunch are untested live |
-| Network | Offline by design: the title cannot reach the network | – |
-| Files and streaming | Archives and streamed data read, zlib and BCPack decoded in parallel | Loading is limited by writes into title memory |
-| Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
-| Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
-| GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
-| GPU: world | Mesh pipelines, shader-written buffers, descriptor lifetimes, indirect execution (arguments clamped), pipelines made by worker threads and kept on disk | Most of the scene is still missing (untranslated shaders drop draws); frames take seconds; real queries, depth bounds, HDR and scaling are missing |
-| Shaders | Console GPU code recompiled to DXIL at first use, cached on disk. Menus: all. World: mesh 8,191 of 8,506, vertex/pixel 10,617 of 12,346, compute 1,643 of 2,539 | 64-bit image atomics, merged geometry stages, the ray-tracing builder's shaders; some compute programs need a GPU with 64-lane waves |
-| Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
-| Series S mode | Runs through the menus to the loading screen | The world, as above |
-
-## Getting started
-
-Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
-shader model 6.6 (and mesh shaders for the world), Rust (pinned in
-`rust-toolchain.toml`).
-
-The title also needs several GiB of available Windows commit at startup.
-Check **Committed** under **Task Manager → Performance → Memory**. If
-`crashes.log` reports Windows error 1455, close other applications or increase
-the Windows paging file size, then retry.
+## Launching and logs
 
 ```powershell
-cargo xtask install-hooks                # asset-policy check on every commit
-copy victory.example.toml victory.toml   # then set your paths (outside the repo)
-cargo test --workspace                   # needs no game data
-cargo run -p victory -- config           # check your paths
+cargo build --locked --profile diag -p victory --features diagnostics
+powershell -NoProfile -ExecutionPolicy Bypass -File .\play.ps1 -Game "D:\Games\GTA VI\game_scarlett_master.exe"
 ```
 
-Run the title:
+The path is remembered after the first run. `-SeriesX` runs as the larger console (about half the frame rate). Each run
+writes `logs\<date_time>\err.txt` (the runtime's log), `out.txt` and `run.txt`.
 
-```powershell
-cargo build --release -p victory
-target\release\victory.exe run <game dir>\<the title's exe> --execute
-```
+## Windows 10
 
-The window caption shows the framerate. Saves, settings and `crashes.log`
-are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
-data under the cache folder.
-
-Input: XInput pads. With none connected the keyboard is a pad while the
-title's window has focus:
-
-| Keys | Pad |
-|------|-----|
-| W A S D / I J K L | left / right stick |
-| arrows | D-pad |
-| Enter, Backspace, X, Y | A, B, X, Y |
-| Q / E, Z / C | shoulders, triggers |
-| F / H | stick clicks |
-| Esc, Tab | Menu, View |
-
-## Commands
-
-```
-victory inspect <exe|dll> [--imports] [--exports]
-victory census [paths...] [--missing] [--strict]
-victory lib-exports <import.lib> [--list]
-victory shader-info [paths...] [--verbose] [--disasm]
-victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
-victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
-            [--console series-x|series-s] [-- <title arguments>]
-victory config
-```
-
-Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
-info and above).
-
-## Debugging
-
-A release build has no debugging aids. Build them in with
-
-```powershell
-cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
-```
-
-| Variable | Effect |
-|----------|--------|
-| `VICTORY_LOG=<target>=debug,...` | debug and trace output |
-| `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
-| `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
-| `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
-| `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
-| `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
-| `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
-| `VICTORY_D3D12_DEBUG=1` | host debug layer |
-| `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
-| `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
-| `VICTORY_PIPELINE_WAIT_MS=24` | reduce the per-frame wait for background pipeline creation from the default of 500 ms. A draw can be omitted until its pipeline is ready |
-| `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
-| `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
-| `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
-| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
-| `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
-| `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
-
-Every build appends crashes and host GPU failures to `crashes.log` in the
-title's data folder.
+The runtime uses the system's Direct3D 12. Windows 10's does not provide Shader Model 6.6, which the game needs, and
+`victory.exe` does not load the D3D12 Agility SDK yet, so Windows 11 is required for now.
 
 ## License
 
-GPL-3.0-or-later. See [LICENSE](LICENSE).
+GPL-3.0, like the projects it is built from. The original project's README is in `README.upstream.md`.

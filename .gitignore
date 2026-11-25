@@ -76,3 +76,7 @@
 *.swp
 Thumbs.db
 .DS_Store
+
+# play.ps1
+/logs/
+/play.local.txt

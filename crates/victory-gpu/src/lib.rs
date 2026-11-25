@@ -65,6 +65,8 @@ mod watch;
 
 #[cfg(windows)]
 mod upscale;
+#[cfg(windows)]
+mod fps_overlay;
 
 #[cfg(windows)]
 pub use host::{adapter as host_adapter, on_failure};
