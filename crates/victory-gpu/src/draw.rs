@@ -2474,6 +2474,13 @@ impl State {
                 // own and copies clamped active records into a scratch
                 // buffer at offset 0.
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+                #[cfg(feature = "diagnostics")]
+                crate::indirect::tag(
+                    p.stages
+                        .first()
+                        .and_then(|stage| u32::from_str_radix(stage.shader.hash.get(..8)?, 16).ok())
+                        .unwrap_or(0),
+                );
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
                 let bounded = if parts.is_some() {
