@@ -2911,7 +2911,7 @@ mod tests {
         };
         // SAFETY: an open list, live resources, locations in the host layout.
         unsafe {
-            back.list.ResourceBarrier(&[crate::host::transition(
+            back.list.Barred(&[crate::host::transition(
                 host_image,
                 D3D12_RESOURCE_STATES(before as i32),
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -3079,19 +3079,19 @@ mod tests {
         unsafe {
             let l = &list.list;
             // The pattern into the twin, the twin into the depth texture.
-            l.ResourceBarrier(&[moved(twin, written, dest), moved(host_depth, tested, dest)]);
+            l.Barred(&[moved(twin, written, dest), moved(host_depth, tested, dest)]);
             l.CopyTextureRegion(&whole(twin), 0, 0, 0, &rows(&upload, 0), None);
-            l.ResourceBarrier(&[moved(twin, dest, source)]);
+            l.Barred(&[moved(twin, dest, source)]);
             l.CopyResource(host_depth, twin);
             // Zeros over the twin, then the depth texture back into it.
-            l.ResourceBarrier(&[moved(twin, source, dest)]);
+            l.Barred(&[moved(twin, source, dest)]);
             l.CopyTextureRegion(&whole(twin), 0, 0, 0, &rows(&upload, 1024), None);
-            l.ResourceBarrier(&[moved(host_depth, dest, source)]);
+            l.Barred(&[moved(host_depth, dest, source)]);
             l.CopyResource(twin, host_depth);
             // The twin read back; both textures to the states they had.
-            l.ResourceBarrier(&[moved(twin, dest, source)]);
+            l.Barred(&[moved(twin, dest, source)]);
             l.CopyTextureRegion(&rows(&readback, 0), 0, 0, 0, &whole(twin), None);
-            l.ResourceBarrier(&[
+            l.Barred(&[
                 moved(twin, source, written),
                 moved(host_depth, source, tested),
             ]);
@@ -3255,9 +3255,9 @@ mod tests {
         // SAFETY: an open list and live resources.
         unsafe {
             let l = &fill.list;
-            l.ResourceBarrier(&[moved(twin, written, dest)]);
+            l.Barred(&[moved(twin, written, dest)]);
             l.CopyTextureRegion(&whole(twin, 0), 0, 0, 0, &rows(&upload, pattern_rows), None);
-            l.ResourceBarrier(&[moved(twin, dest, written)]);
+            l.Barred(&[moved(twin, dest, written)]);
         }
         fill.close();
         host.execute(&[&fill]);
@@ -3277,10 +3277,10 @@ mod tests {
         // SAFETY: an open list and live resources; a whole subresource.
         unsafe {
             let l = &back.list;
-            l.ResourceBarrier(&[moved(host_depth, state, source)]);
+            l.Barred(&[moved(host_depth, state, source)]);
             let (to, from) = (rows(&readback, plane), whole(host_depth, 1));
             l.CopyTextureRegion(&to, 0, 0, 0, &from, None);
-            l.ResourceBarrier(&[moved(host_depth, source, state)]);
+            l.Barred(&[moved(host_depth, source, state)]);
         }
         back.close();
         host.execute(&[&back]);
@@ -3482,9 +3482,9 @@ mod tests {
         // SAFETY: an open list and live resources.
         unsafe {
             let l = &fill.list;
-            l.ResourceBarrier(&[moved(plane, written, dest)]);
+            l.Barred(&[moved(plane, written, dest)]);
             l.CopyTextureRegion(&whole(plane), 0, 0, 0, &rows(&upload, rows_of(53)), None);
-            l.ResourceBarrier(&[moved(plane, dest, written)]);
+            l.Barred(&[moved(plane, dest, written)]);
         }
         fill.close();
         host.execute(&[&fill]);
@@ -3572,7 +3572,7 @@ float4 lit() : SV_Target { return 1.0; }
         unsafe {
             let l = &back.list;
             if state != tested {
-                l.ResourceBarrier(&[moved(host_depth, state, tested)]);
+                l.Barred(&[moved(host_depth, state, tested)]);
             }
             l.ClearRenderTargetView(colour, &[0.0; 4], None);
             l.SetGraphicsRootSignature(&signature);
@@ -3598,7 +3598,7 @@ float4 lit() : SV_Target { return 1.0; }
                 l.SetGraphicsRoot32BitConstant(0, class, 0);
                 l.DrawInstanced(3, 1, 0, 0);
             }
-            l.ResourceBarrier(&[moved(&target, drawn, source)]);
+            l.Barred(&[moved(&target, drawn, source)]);
             let (to, from) = (rows(&readback, rows_of(61)), whole(&target));
             l.CopyTextureRegion(&to, 0, 0, 0, &from, None);
         }

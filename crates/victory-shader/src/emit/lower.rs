@@ -947,6 +947,8 @@ thread_local! {
     static NEEDS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
     /// See [`with_local_waves`].
     static LOCAL_WAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// See [`last_waves`].
+    static LAST_WAVES: std::cell::Cell<Option<(Option<bool>, bool, bool, bool)>> = const { std::cell::Cell::new(None) };
     /// See [`with_local_waves_any`].
     static LOCAL_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -1014,6 +1016,16 @@ thread_local! {
 fn own_bits_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_OWN_BITS").is_none_or(|v| v != "0"))
+}
+
+/// How the last program lowered on this thread stands to the host's waves,
+/// for reports: whether it is a console wave64 program run as two host
+/// waves of 32 (and then whether its groups have no upper half), whether
+/// each host wave acts as a wave of its own, whether every mask and lane
+/// read is taken per host wave, and whether a group barrier comes before
+/// every LDS access.
+pub fn last_waves() -> Option<(Option<bool>, bool, bool, bool)> {
+    LAST_WAVES.get()
 }
 
 /// What [`set_host_max_wave`] was told (0: nothing).
@@ -1463,6 +1475,12 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        LAST_WAVES.set(Some((
+            exchange.as_ref().map(|e| e.1),
+            exchange.is_some() && LOCAL_WAVES.get(),
+            LOCAL_ANY.get(),
+            split_lds,
+        )));
         Lower {
             s,
             x,

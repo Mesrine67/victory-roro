@@ -1247,17 +1247,17 @@ fn record_twin_copy(
     // SAFETY: an open list and live resources; the buffer was made as big
     // as these footprints, and rests in the common state between copies.
     unsafe {
-        list.ResourceBarrier(&[transition(through, common, dest)]);
+        list.Barred(&[transition(through, common, dest)]);
         for (i, row) in rows.iter().enumerate() {
             let index = first_from + i as u32;
             list.CopyTextureRegion(&placed(row), 0, 0, 0, &subresource(from, index), None);
         }
-        list.ResourceBarrier(&[transition(through, dest, source)]);
+        list.Barred(&[transition(through, dest, source)]);
         for (i, row) in rows.iter().enumerate() {
             let index = first_to + i as u32;
             list.CopyTextureRegion(&subresource(to, index), 0, 0, 0, &placed(row), None);
         }
-        list.ResourceBarrier(&[transition(through, source, common)]);
+        list.Barred(&[transition(through, source, common)]);
     }
 }
 
@@ -1285,6 +1285,62 @@ static BUDGET_USE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomi
 /// its lists had, and that record (kind, tag, the three words asked, cost).
 static BIG_RECORDS: std::sync::Mutex<std::collections::BTreeMap<(u32, u32), (u64, [u32; 6])>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Timing runs: barriers recorded on a host list since its last noted
+/// command, by the list's address: transitions, aliasing, unordered access.
+#[cfg(feature = "diagnostics")]
+static BARRIERS: Mutex<Option<std::collections::HashMap<usize, [u32; 3]>>> = Mutex::new(None);
+
+/// The barriers counted for the list at `list` since they were last taken.
+#[cfg(feature = "diagnostics")]
+fn barriers_taken(list: usize) -> [u32; 3] {
+    let mut by = BARRIERS.lock().unwrap_or_else(|e| e.into_inner());
+    by.as_mut().and_then(|by| by.remove(&list)).unwrap_or([0; 3])
+}
+
+/// A list's `ResourceBarrier`. Every barrier of ours is recorded through
+/// it, so that a timing run (`VICTORY_GPU_TIMING`) can say which commands a
+/// barrier comes before: the card's time for a barrier is counted to the
+/// noted command before it.
+#[allow(non_snake_case)]
+pub(crate) trait Barred {
+    /// # Safety
+    /// As `ID3D12GraphicsCommandList::ResourceBarrier`.
+    unsafe fn Barred(&self, barriers: &[D3D12_RESOURCE_BARRIER]);
+}
+
+impl Barred for ID3D12GraphicsCommandList {
+    unsafe fn Barred(&self, barriers: &[D3D12_RESOURCE_BARRIER]) {
+        #[cfg(feature = "diagnostics")]
+        if timing() {
+            let mut by = BARRIERS.lock().unwrap_or_else(|e| e.into_inner());
+            let n = by
+                .get_or_insert_with(std::collections::HashMap::new)
+                .entry(Interface::as_raw(self) as usize)
+                .or_insert([0; 3]);
+            for b in barriers {
+                n[(b.Type.0 as usize).min(2)] += 1;
+            }
+        }
+        // SAFETY: the caller's.
+        unsafe { self.ResourceBarrier(barriers) }
+    }
+}
+
+/// `VICTORY_GPU_TIMING_DUMP=<folder>` in a timing run: every 20th frame's
+/// noted commands, in the order they ran, with the card's time for each, as
+/// `frame-<n>.tsv` (submission, list of the submission, command of the
+/// list, milliseconds, the note with the barriers recorded before it).
+#[cfg(feature = "diagnostics")]
+fn timing_dump() -> Option<&'static std::path::Path> {
+    static DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::path::PathBuf::from(std::env::var_os("VICTORY_GPU_TIMING_DUMP")?);
+        std::fs::create_dir_all(&dir).ok()?;
+        Some(dir)
+    })
+    .as_deref()
+}
 
 /// Whether each list of a submission runs and is timed on its own, slow
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
@@ -3339,7 +3395,7 @@ impl Host {
                         // compare after the lists hashes the declared
                         // pieces and flags those whose hash is another.
                         if !ranges.is_empty() {
-                            list.ResourceBarrier(&[transition(
+                            list.Barred(&[transition(
                                 &shadow.buffer,
                                 D3D12_RESOURCE_STATE_COPY_DEST,
                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
@@ -3434,7 +3490,7 @@ impl Host {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
                     // What the submission's shaders wrote, first.
-                    list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                    list.Barred(&[D3D12_RESOURCE_BARRIER {
                         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
                         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
                         Anonymous: D3D12_RESOURCE_BARRIER_0 {
@@ -4396,6 +4452,21 @@ impl Host {
                 for (ms, op) in runs[i].slowest(frequency, usize::MAX) {
                     crate::copystat::command_took(&op, ms);
                 }
+                let frame = crate::queue::frame_count();
+                if let Some(dir) = timing_dump()
+                    && frame % 20 == 0
+                    && let Ok(mut file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(dir.join(format!("frame-{frame}.tsv")))
+                {
+                    use std::io::Write;
+                    let mut text = String::new();
+                    for (n, (ms, op)) in runs[i].in_order(frequency).into_iter().enumerate() {
+                        text += &format!("{}\t{i}\t{n}\t{ms:.4}\t{op}\n", *submitted);
+                    }
+                    let _ = file.write_all(text.as_bytes());
+                }
             }
             // A submission of one list was never named here (`groups.len()
             // > 1` was the test): the two 50 ms lists of the gameplay
@@ -4720,6 +4791,34 @@ impl HostList {
             .as_ref()
     }
 
+    /// The noted commands in the order they ran, each with its time on the
+    /// GPU in milliseconds and its whole text (diagnostics, timing on, after
+    /// the list ran).
+    #[cfg(feature = "diagnostics")]
+    fn in_order(&self, frequency: u64) -> Vec<(f64, String)> {
+        let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+        let (Some((_, back)), count) = (self.stamps(), notes.len().min(STAMPS as usize - 1)) else {
+            return Vec::new();
+        };
+        let mut data = std::ptr::null_mut();
+        let range = D3D12_RANGE { Begin: 0, End: (count + 1) * 8 };
+        // SAFETY: a read-back buffer the finished list resolved into.
+        let stamps: Vec<u64> = unsafe {
+            if back.Map(0, Some(&range), Some(&mut data)).is_err() {
+                return Vec::new();
+            }
+            let s = std::slice::from_raw_parts(data.cast::<u64>(), count + 1).to_vec();
+            back.Unmap(0, None);
+            s
+        };
+        (0..count)
+            .map(|i| {
+                let ticks = stamps[i + 1].saturating_sub(stamps[i]);
+                (ticks as f64 * 1e3 / frequency.max(1) as f64, notes[i].0.clone())
+            })
+            .collect()
+    }
+
     /// The noted commands that took longest on the GPU, longest first, as
     /// (milliseconds, text) (diagnostics, timing on, after the list ran).
     #[cfg(feature = "diagnostics")]
@@ -4753,6 +4852,11 @@ impl HostList {
     pub(crate) fn close(&self) {
         self.end_mesh_batch();
         self.twins_to_depth();
+        // (barriers after the last noted command are no command's "before")
+        #[cfg(feature = "diagnostics")]
+        if timing() {
+            barriers_taken(Interface::as_raw(&self.list) as usize);
+        }
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -4854,7 +4958,7 @@ impl HostList {
                 D3D12_RESOURCE_STATES(wanted as i32),
             );
             // SAFETY: an open list and a live texture.
-            unsafe { self.list.ResourceBarrier(&[barrier]) };
+            unsafe { self.list.Barred(&[barrier]) };
         }
     }
 
@@ -5104,13 +5208,13 @@ impl HostList {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
                 if !to_copy.is_empty() {
-                    list.ResourceBarrier(&to_copy);
+                    list.Barred(&to_copy);
                 }
                 for (depth, twin, colour) in &syncs {
                     record_twin_copy(list, &depth.texture, twin, *colour);
                 }
                 if !barriers.is_empty() {
-                    list.ResourceBarrier(&barriers);
+                    list.Barred(&barriers);
                 }
                 list.Close()
             })
@@ -5151,6 +5255,13 @@ impl HostList {
                 unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
             }
             let what = what();
+            // (a timing run's dump says which commands a barrier comes before)
+            let what = if timing() {
+                let b = barriers_taken(Interface::as_raw(&self.list) as usize);
+                format!("{what} | barriers before: {} {} {}", b[0], b[1], b[2])
+            } else {
+                what
+            };
             crate::capture::op(std::ptr::from_ref(self) as usize, || what.clone());
             let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
             const UNICODE: u32 = 0;
@@ -6581,7 +6692,7 @@ impl Host {
             };
             copy.reset();
             let list = &copy.list;
-            list.ResourceBarrier(&[
+            list.Barred(&[
                 transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
                 transition(
                     &back,
@@ -6598,7 +6709,7 @@ impl Host {
             let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            list.ResourceBarrier(&[
+            list.Barred(&[
                 transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
                 transition(
                     &back,

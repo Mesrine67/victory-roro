@@ -20,6 +20,7 @@
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
 //! the title needs more.
 
+use crate::host::Barred as _;
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -616,7 +617,7 @@ fn record_gpu_clamp(
     let skip = usize::from(!waits);
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
-        l.ResourceBarrier(&first[skip..]);
+        l.Barred(&first[skip..]);
         if groups > 0 {
             l.SetComputeRootSignature(&c.root);
             l.SetPipelineState(&c.pso);
@@ -627,7 +628,7 @@ fn record_gpu_clamp(
             l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(groups, 1, 1);
         }
-        l.ResourceBarrier(&second[skip..]);
+        l.Barred(&second[skip..]);
     }
 }
 
@@ -640,7 +641,7 @@ pub(crate) fn done(list: &HostList, scratch: &ID3D12Resource) {
 fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
     // SAFETY: an open list and a live scratch buffer in INDIRECT_ARGUMENT.
     unsafe {
-        list.ResourceBarrier(&[transition(
+        list.Barred(&[transition(
             scratch,
             D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
             D3D12_RESOURCE_STATE_COMMON,
@@ -1208,14 +1209,14 @@ void main() {
         // then return `dst_buf` to `COMMON` before Call #2).
         // SAFETY: open command list; `dst_buf` returned to `COMMON` by `done_on`.
         unsafe {
-            warp.list.ResourceBarrier(&[transition(
+            warp.list.Barred(&[transition(
                 &dst_buf,
                 D3D12_RESOURCE_STATE_COMMON,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
             warp.list
                 .CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, u64::from(STRIDE * 5));
-            warp.list.ResourceBarrier(&[transition(
+            warp.list.Barred(&[transition(
                 &dst_buf,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
                 D3D12_RESOURCE_STATE_COMMON,
@@ -1402,13 +1403,13 @@ void main() {
             done_on(&warp.list, &dst_buf);
             // SAFETY: an open list; the scratch buffer is copied for the check.
             unsafe {
-                warp.list.ResourceBarrier(&[transition(
+                warp.list.Barred(&[transition(
                     &dst_buf,
                     D3D12_RESOURCE_STATE_COMMON,
                     D3D12_RESOURCE_STATE_COPY_SOURCE,
                 )]);
                 warp.list.CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, total as u64);
-                warp.list.ResourceBarrier(&[transition(
+                warp.list.Barred(&[transition(
                     &dst_buf,
                     D3D12_RESOURCE_STATE_COPY_SOURCE,
                     D3D12_RESOURCE_STATE_COMMON,
@@ -1479,7 +1480,7 @@ void main() {
         unsafe {
             offsets.cast::<[u32; 4]>().write([3, 48, 16, 80]);
             done_on(&warp.list, &dst);
-            warp.list.ResourceBarrier(&[transition(
+            warp.list.Barred(&[transition(
                 &dst,
                 D3D12_RESOURCE_STATE_COMMON,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -1546,14 +1547,14 @@ void main() {
 
         // SAFETY: open command list; copy clamped scratch buffer for verification.
         unsafe {
-            warp.list.ResourceBarrier(&[transition(
+            warp.list.Barred(&[transition(
                 &dst_buf,
                 D3D12_RESOURCE_STATE_COMMON,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
             warp.list
                 .CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, total_bytes as u64);
-            warp.list.ResourceBarrier(&[transition(
+            warp.list.Barred(&[transition(
                 &dst_buf,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
                 D3D12_RESOURCE_STATE_COMMON,

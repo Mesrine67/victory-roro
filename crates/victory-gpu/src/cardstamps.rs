@@ -18,6 +18,7 @@
 //! wait for every earlier shader write, so that the last timestamp is taken
 //! after the passes have run and not when the card has merely read them.
 
+use crate::host::Barred as _;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -213,7 +214,7 @@ impl Run {
 pub(crate) fn wait_for_writes(list: &ID3D12GraphicsCommandList) {
     // SAFETY: an open list; a barrier that names no resource.
     unsafe {
-        list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+        list.Barred(&[D3D12_RESOURCE_BARRIER {
             Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
             Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
             Anonymous: D3D12_RESOURCE_BARRIER_0 {
