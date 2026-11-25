@@ -1145,6 +1145,189 @@ fn upscale_pipeline(format: DXGI_FORMAT) -> Option<PlanePipeline> {
     pipeline
 }
 
+/// The title's interface plane (HUD, map, menus, text), drawn over the
+/// presented picture by its alpha: the console composes its two present
+/// planes so. Premultiplied by default; `VICTORY_UI_PLANE=straight` blends
+/// by straight alpha instead, `VICTORY_UI_PLANE=0` leaves the plane out.
+const OVERLAY: &str = r#"
+#define RS "DescriptorTable(SRV(t0), visibility = SHADER_VISIBILITY_PIXEL), RootConstants(num32BitConstants = 4, b0, visibility = SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter = FILTER_MIN_MAG_LINEAR_MIP_POINT, addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP, visibility = SHADER_VISIBILITY_PIXEL)"
+Texture2D<float4> plane : register(t0);
+SamplerState smooth : register(s0);
+cbuffer sizes : register(b0) { float2 scale; float2 unused; };
+[RootSignature(RS)]
+float4 overlay(float4 p : SV_Position) : SV_Target {
+    return plane.SampleLevel(smooth, p.xy * scale, 0);
+}
+"#;
+
+/// Whether the title's interface plane is drawn (`VICTORY_UI_PLANE`, see [`OVERLAY`]).
+pub(crate) fn ui_plane_on() -> bool {
+    ui_plane_mode() != 0
+}
+
+/// 0 off, 1 premultiplied alpha, 2 straight alpha.
+fn ui_plane_mode() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_UI_PLANE").as_deref() {
+        Ok("0") => 0,
+        Ok("straight") => 2,
+        _ => 1,
+    })
+}
+
+/// The plain format of the typeless families the title's targets come in.
+fn typed_format(f: DXGI_FORMAT) -> DXGI_FORMAT {
+    DXGI_FORMAT(match f.0 {
+        9 => 10,
+        23 => 24,
+        27 => 28,
+        f => f,
+    })
+}
+
+fn overlay_pipeline(format: DXGI_FORMAT) -> Option<PlanePipeline> {
+    use windows::core::s;
+    static MADE: Mutex<UpscalePipelines> = Mutex::new(UpscalePipelines(Vec::new()));
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, pipeline)) = made.0.iter().find(|m| m.0 == format.0) {
+        return pipeline.clone();
+    }
+    let make = || -> windows::core::Result<PlanePipeline> {
+        let device = &host().ok_or_else(windows::core::Error::empty)?.device;
+        let vs = compile(PLANE_CORNERS, s!("corner"), s!("vs_5_1"))?;
+        let ps = compile(OVERLAY, s!("overlay"), s!("ps_5_1"))?;
+        let code = |bytes: &[u8]| D3D12_SHADER_BYTECODE {
+            pShaderBytecode: bytes.as_ptr().cast(),
+            BytecodeLength: bytes.len(),
+        };
+        let mut blend = D3D12_BLEND_DESC::default();
+        let rt = &mut blend.RenderTarget[0];
+        rt.BlendEnable = true.into();
+        rt.SrcBlend = if ui_plane_mode() == 2 { D3D12_BLEND_SRC_ALPHA } else { D3D12_BLEND_ONE };
+        rt.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+        rt.BlendOp = D3D12_BLEND_OP_ADD;
+        rt.SrcBlendAlpha = D3D12_BLEND_ZERO;
+        rt.DestBlendAlpha = D3D12_BLEND_ONE;
+        rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        rt.RenderTargetWriteMask = 15;
+        let mut formats = [DXGI_FORMAT(0); 8];
+        formats[0] = format;
+        // SAFETY: the root signature is inside the pixel shader; the
+        // description points at live data and never releases its pointer.
+        unsafe {
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, &ps[..])?;
+            let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                VS: code(&vs[..]),
+                PS: code(&ps[..]),
+                BlendState: blend,
+                SampleMask: u32::MAX,
+                RasterizerState: D3D12_RASTERIZER_DESC {
+                    FillMode: D3D12_FILL_MODE_SOLID,
+                    CullMode: D3D12_CULL_MODE_NONE,
+                    DepthClipEnable: true.into(),
+                    ..Default::default()
+                },
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: 1,
+                RTVFormats: formats,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            };
+            let pipeline: ID3D12PipelineState = device.CreateGraphicsPipelineState(&desc)?;
+            Ok((root, pipeline))
+        }
+    };
+    let pipeline = match make() {
+        Ok(pipeline) => Some(pipeline),
+        Err(e) => {
+            tracing::warn!(error = %e, format = format.0, "no pipeline for the interface plane: it is not shown");
+            None
+        }
+    };
+    made.0.push((format.0, pipeline.clone()));
+    pipeline
+}
+
+/// Records into `list` the interface plane `plane` (readable by pixel
+/// shaders) drawn over `back` (a render target of `format`, `width` by
+/// `height`), stretched to it. False if nothing was recorded.
+fn record_overlay(
+    list: &ID3D12GraphicsCommandList,
+    plane: &ID3D12Resource,
+    back: &ID3D12Resource,
+    format: DXGI_FORMAT,
+    width: u32,
+    height: u32,
+) -> bool {
+    let (Some(host), Some(pass)) = (host(), plane_pass()) else {
+        return false;
+    };
+    let Some((root, pipeline)) = overlay_pipeline(format) else {
+        return false;
+    };
+    // SAFETY: a live resource.
+    let from = unsafe { plane.GetDesc() };
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| {
+        tracing::info!(
+            plane = format_args!("{}x{} f{}", from.Width, from.Height, from.Format.0),
+            window = format_args!("{width}x{height} f{}", format.0),
+            mode = ui_plane_mode(),
+            "the title's interface plane drawn over its picture (VICTORY_UI_PLANE=0: left out)"
+        );
+    });
+    let slot = pass.next.fetch_add(1, Ordering::Relaxed) % PLANE_VIEWS;
+    let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: typed_format(from.Format),
+        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Texture2D: D3D12_TEX2D_SRV {
+                MostDetailedMip: 0,
+                MipLevels: 1,
+                ..Default::default()
+            },
+        },
+    };
+    let target = host.rtv(Some(back), None);
+    let sizes: [f32; 4] = [1.0 / width as f32, 1.0 / height as f32, 0.0, 0.0];
+    let cpu = D3D12_CPU_DESCRIPTOR_HANDLE {
+        ptr: pass.cpu + (slot * pass.step) as usize,
+    };
+    let gpu = D3D12_GPU_DESCRIPTOR_HANDLE {
+        ptr: pass.gpu + u64::from(slot * pass.step),
+    };
+    // SAFETY: an open list; a slot of our heap; live resources and objects
+    // (the pass's own live as long as the process); four constants.
+    unsafe {
+        host.device.CreateShaderResourceView(plane, Some(&view), cpu);
+        list.SetDescriptorHeaps(&[Some(pass.views.clone())]);
+        list.SetGraphicsRootSignature(&root);
+        list.SetPipelineState(&pipeline);
+        list.SetGraphicsRootDescriptorTable(0, gpu);
+        list.SetGraphicsRoot32BitConstants(1, 4, sizes.as_ptr().cast(), 0);
+        list.OMSetRenderTargets(1, Some(&target), false, None);
+        list.RSSetViewports(&[D3D12_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: width as f32,
+            Height: height as f32,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        }]);
+        list.RSSetScissorRects(&[RECT {
+            left: 0,
+            top: 0,
+            right: width as i32,
+            bottom: height as i32,
+        }]);
+        list.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY(4));
+        list.DrawInstanced(3, 1, 0, 0);
+    }
+    true
+}
+
 /// Records into `list` the pass that draws the first `render` texels of
 /// `colour` (readable by pixel shaders) over the first `size` texels of
 /// `output` (in the render target state). As [`record_plane_pass`] it puts
@@ -6804,9 +6987,17 @@ impl Meter {
 
 impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
-    /// as frame `frame` (saved if captures are on). `None` if nothing was
-    /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    /// with `overlay` (the title's interface plane, readable by pixel
+    /// shaders) drawn over it, as frame `frame` (saved if captures are on;
+    /// the saved picture is `texture` alone). `None` if nothing was shown;
+    /// else, in diagnostics builds, whether the frame was black.
+    pub(crate) fn present(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        overlay: Option<&ID3D12Resource>,
+        frame: u64,
+    ) -> Option<bool> {
         crate::zone!("present to window");
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
@@ -6890,13 +7081,22 @@ impl Host {
             let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
+            // The interface plane over the picture: the back buffer as a render target for it.
+            let back_was = match overlay {
+                Some(plane) => {
+                    list.Barred(&[transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    )]);
+                    record_overlay(list, plane, &back, format, width, height);
+                    D3D12_RESOURCE_STATE_RENDER_TARGET
+                }
+                None => D3D12_RESOURCE_STATE_COPY_DEST,
+            };
             list.Barred(&[
                 transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                ),
+                transition(&back, back_was, D3D12_RESOURCE_STATE_PRESENT),
             ]);
             copy.close();
             match slot {

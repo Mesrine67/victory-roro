@@ -585,13 +585,19 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     }
 }
 
-/// The start of a present plane: frame token, then the plane's resources.
+/// A present plane: frame token, the plane's resources, its source and destination
+/// rectangles, then its colour space and flags. 72 bytes: the title's array of two planes
+/// (the picture, then its interface) puts the second at +0x48.
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
+    _source: *const u8,
+    _destination: *const u8,
+    _rest: [u64; 4],
 }
+const _: () = assert!(size_of::<Plane>() == 0x48);
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -756,10 +762,12 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
-/// Shows the first plane's first resource in our window.
+/// Shows the first plane's first resource in our window, with the second
+/// plane's (the title's interface: HUD, map, menus, text) drawn over it by
+/// its alpha, as the console composes them.
 ///
-/// shortcut: one plane, no scaling or placement, the source expected in
-/// the common state.
+/// shortcut: two planes at most, no placement (each plane fills the
+/// window), the sources expected in the common state.
 extern "system" fn present(
     _: This,
     planes: u32,
@@ -834,10 +842,27 @@ extern "system" fn present(
         && let Some(host) = crate::host::host()
     {
         const COPY_SOURCE: u32 = 0x800;
+        const PIXEL_READ: u32 = 0x80;
+        // The interface plane, if the title presents one (`VICTORY_UI_PLANE=0`: left out).
+        let overlay = (planes > 1 && crate::host::ui_plane_on())
+            // SAFETY: the title passes `planes` plane descriptions.
+            .then(|| unsafe { plane_parameters.add(1).as_ref() })
+            .flatten()
+            .filter(|p| p.count > 0 && !p.resources.is_null())
+            // SAFETY: the plane lists `count` resources.
+            .map(|p| unsafe { *p.resources })
+            .filter(|&r| r != resource)
+            .and_then(|r| crate::resource::host_resource(r).map(|t| (r, t)));
+        let overlay_state = overlay.as_ref().map(|(r, _)| {
+            crate::resource::host_transition(*r, PIXEL_READ).map_or(PIXEL_READ, |(_, before)| before)
+        });
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
+        let shown = host.present(texture, state, overlay.as_ref().map(|(_, t)| *t), frame);
         crate::resource::host_transition(resource, state);
+        if let (Some((r, _)), Some(before)) = (&overlay, overlay_state) {
+            crate::resource::host_transition(*r, before);
+        }
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
         #[cfg(not(feature = "diagnostics"))]
