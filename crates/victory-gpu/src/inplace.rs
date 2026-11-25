@@ -68,11 +68,7 @@ pub(crate) fn probe_level() -> u8 {
 /// part of the title's allocation is opened as a host heap and the window
 /// is a buffer placed over it ([`place_for`]). 2: title buffers too,
 /// except the big ones in the card's memory. 3: those as well (for
-/// measuring: shaders then read them over the bus again). 4: title
-/// buffers only, the big ones included, and no windows (they are copied
-/// as with 0): what the buffers alone cost and save, beside 3. Textures
-/// are never in place at any level: each has a host texture in the card's
-/// memory, filled by copies.
+/// measuring: shaders then read them over the bus again).
 ///
 /// What it covers: private memory (`XMemVirtualAlloc`'s), by a heap opened
 /// on a part of the allocation; and view memory (the page pool) where the
@@ -264,7 +260,7 @@ fn section_view(section: usize) -> Option<usize> {
 /// buffers or a title buffer, if [`level`] asks for it and the memory can
 /// be opened; `None` leaves the caller to make a copy, as before.
 pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
-    if level() < if window { 1 } else { 2 } || (window && level() == 4) {
+    if level() < if window { 1 } else { 2 } {
         return None;
     }
     // View memory: known from the runtime without asking Windows. One run
