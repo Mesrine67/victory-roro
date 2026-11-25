@@ -5756,9 +5756,66 @@ struct Presenter {
     meter: Meter,
 }
 
+fn process_cpu_us() -> Option<u64> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    // SAFETY: plain C structs, zero is a valid value for each.
+    let (mut creation, mut exit, mut kernel, mut user) = unsafe {
+        (
+            std::mem::zeroed::<FILETIME>(),
+            std::mem::zeroed::<FILETIME>(),
+            std::mem::zeroed::<FILETIME>(),
+            std::mem::zeroed::<FILETIME>(),
+        )
+    };
+    // SAFETY: the current-process pseudo handle and four writable FILETIMEs.
+    let ok = unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let ticks = |f: FILETIME| (u64::from(f.dwHighDateTime) << 32) | u64::from(f.dwLowDateTime);
+    Some((ticks(kernel) + ticks(user)) / 10)
+}
+
+fn process_working_set() -> Option<u64> {
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // SAFETY: a plain C struct, zero is a valid value.
+    let mut counters = unsafe { std::mem::zeroed::<PROCESS_MEMORY_COUNTERS>() };
+    // SAFETY: the current-process pseudo handle and a counter of the size passed.
+    let ok = unsafe {
+        GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            &mut counters,
+            std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        )
+    };
+    (ok != 0).then_some(counters.WorkingSetSize as u64)
+}
+
+fn logical_processors() -> u32 {
+    use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+    // SAFETY: the call fills the plain struct.
+    let mut info = unsafe { std::mem::zeroed::<SYSTEM_INFO>() };
+    // SAFETY: as above.
+    unsafe { GetSystemInfo(&mut info) };
+    info.dwNumberOfProcessors.max(1)
+}
+
 /// The frame rate, shown in the window's caption every second and logged
 /// every few seconds.
 struct Meter {
+    cpu_us: u64,
     since: std::time::Instant,
     frames: u32,
     #[cfg(feature = "diagnostics")]
@@ -5773,6 +5830,7 @@ impl Meter {
     fn new() -> Self {
         let now = std::time::Instant::now();
         Meter {
+            cpu_us: if crate::frametime::enabled() { process_cpu_us().unwrap_or(0) } else { 0 },
             since: now,
             frames: 0,
             #[cfg(feature = "diagnostics")]
@@ -5791,6 +5849,7 @@ impl Meter {
         crate::copystat::presented();
         #[cfg(feature = "diagnostics")]
         crate::callers::presented();
+        crate::frametime::tick();
         self.frames += 1;
         #[cfg(feature = "diagnostics")]
         {
@@ -5846,33 +5905,30 @@ impl Meter {
         late_line(frames);
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);
-        {
-            let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
-            if passes + compares > 0.0 {
-                tracing::info!(
-                    "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
-                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes",
-                    if rehash_runs() { "on" } else { "off" }
-                );
-            }
+        let [card_passes, card_pieces, card_compares] =
+            [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        if card_passes + card_compares > 0.0 {
+            tracing::info!(
+                "our passes over copies in the card's memory per frame: {card_passes:.0} hash passes over {card_pieces:.0} pieces after \
+                 ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {card_compares:.0} compare passes",
+                if rehash_runs() { "on" } else { "off" }
+            );
         }
-        {
-            let [own, asking, still, all] =
-                [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
-            if all >= 1.0 {
-                tracing::info!(
-                    "texture refreshes per frame, all threads: {all:.1} ms, of them {own:.1} ms waiting for a texture another thread \
-                     is refreshing, {asking:.1} ms asking the write watch and the guards, {still:.1} ms waiting for title memory to \
-                     hold still (the runtime remapping it); the rest is reading, hashing and detiling"
-                );
-            }
-            let [through, left] = [0, 1].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
-            if through + left > 0.0 {
-                tracing::info!(
-                    "texture refreshes that did not wait for title memory to hold still, per frame (VICTORY_TEXTURE_NO_WAIT=1): \
-                     {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there)"
-                );
-            }
+        let [own, asking, still, texture_refresh_ms] =
+            [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+        if texture_refresh_ms >= 1.0 {
+            tracing::info!(
+                "texture refreshes per frame, all threads: {texture_refresh_ms:.1} ms, of them {own:.1} ms waiting for a texture another thread \
+                 is refreshing, {asking:.1} ms asking the write watch and the guards, {still:.1} ms waiting for title memory to \
+                 hold still (the runtime remapping it); the rest is reading, hashing and detiling"
+            );
+        }
+        let [through, left] = [0, 1].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        if through + left > 0.0 {
+            tracing::info!(
+                "texture refreshes that did not wait for title memory to hold still, per frame (VICTORY_TEXTURE_NO_WAIT=1): \
+                 {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there)"
+            );
         }
         {
             let [copies, joined] = [0, 1].map(|i| COPIES_JOINED[i].swap(0, Ordering::Relaxed) as f64 / frames);
@@ -5900,6 +5956,53 @@ impl Meter {
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
+        // `VICTORY_FRAMETIME_DUMP`: one row per summary interval, with the
+        // buckets above and the worst/mean frame measured at each present.
+        if crate::frametime::enabled() {
+            let now = process_cpu_us().unwrap_or(self.cpu_us);
+            let cpu_pct = now.saturating_sub(self.cpu_us) as f64 / 1e6
+                / elapsed.as_secs_f64() / f64::from(logical_processors()) * 100.0;
+            self.cpu_us = now;
+            let (frame_ms_max, frame_ms_avg, _timed) = crate::frametime::take_interval();
+            crate::frametime::record(&crate::frametime::Row {
+                frame: crate::queue::frame_count(),
+                frames,
+                fps,
+                ms,
+                frame_ms_max,
+                frame_ms_avg,
+                cpu_prepare_ms: cpu,
+                gpu_ms: gpu,
+                gpu_pct: gpu / ms * 100.0,
+                copies_ms: copy_ms,
+                copies_mb: copy_mb,
+                textures_ms: texture_ms,
+                textures_mb: texture_mb,
+                copyback_ms: back_ms,
+                copyback_mb: back_mb,
+                draws,
+                dropped,
+                making: crate::pipeline::making() as f64,
+                indirect,
+                heap_passes: picked,
+                heap_ms: picked_ms,
+                texture_refresh_ms,
+                card_passes,
+                card_compares,
+                card_sent_mb: card[0] as f64 / frames / 1e6,
+                card_ranges: card[1] as f64 / frames,
+                card_pieces: card[2] as f64 / frames,
+                card_fetched: card[3] as f64 / frames,
+                card_fetched_mb: card[4] as f64 / frames / 1e6,
+                card_waits: card[5] as f64 / frames,
+                card_wait_ms: card[6] as f64 / frames / 1e3,
+                twins_into_depth: twin_to_depth,
+                twins_into_colour: twin_to_colour,
+                depth_planes: planes,
+                ram_mb: process_working_set().unwrap_or(0) as f64 / (1024.0 * 1024.0),
+                cpu_pct,
+            });
+        }
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
             tracing::info!(
