@@ -15,6 +15,7 @@ anyhow.workspace = true
 victory-formats.workspace = true
 victory-pipeline.workspace = true
 victory-shader.workspace = true
+tracy-client = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -22,6 +23,8 @@ tempfile.workspace = true
 [features]
 # Debugging switches (frame capture, the host debug layer, per-draw data).
 diagnostics = []
+# Tracy zones around the stages of a frame (`prof.rs`).
+tracy = ["dep:tracy-client"]
 
 [lints]
 workspace = true

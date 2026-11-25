@@ -131,6 +131,7 @@ impl Pending {
     }
 
     fn make(&self) {
+        crate::zone!("make pipeline");
         let _ = self.begun.set(Instant::now());
         self.made
             .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
@@ -285,6 +286,7 @@ fn shared_budget() -> bool {
 
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
+    crate::zone!("pipeline wait");
     let budget = wait_budget();
     if budget.is_zero() || slow(p) {
         return;

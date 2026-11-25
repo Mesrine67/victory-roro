@@ -2727,6 +2727,7 @@ fn read_backs(list: &HostList) {
 /// After the card ran what declared `back`: what shaders wrote there goes
 /// into title memory, and the ranges are done with.
 fn hand_back(back: &[Declared]) {
+    crate::zone!("copy back: hand back");
     if crate::shadow::wide_back() {
         // Every range first (the pieces that differ, found on several
         // threads), then the merges, in order, as below.
@@ -3035,6 +3036,7 @@ impl Host {
     /// then stores the hashes it makes (see [`flagged_pieces`] and
     /// `relay`).
     fn card_before(&self, runs: &[&HostList], flown: bool) -> Option<CardPlan> {
+        crate::zone!("card plan");
         use std::sync::Arc;
         if !crate::shadow::cards() {
             return None;
@@ -3305,6 +3307,7 @@ impl Host {
     /// bytes, which that flight's landing then finds merged already; and
     /// nothing is sent back up.
     fn relay_card_back(&self, plans: &[&CardPlan], fetch: &mut Option<RelayFetch>) {
+        crate::zone!("relay: card back");
         let differs = {
             let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
             work.as_ref().map(|work| (work.differs.1, (work.differs.2 / 4) as usize))
@@ -3426,6 +3429,7 @@ impl Host {
     /// bottom-of-pipe writes and the fence signals behind it. Title memory
     /// is complete before the title is told anything.
     fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
+        crate::zone!("relay: land");
         let landing = std::time::Instant::now();
         {
             let flights: Vec<&Flight> = items
@@ -3549,6 +3553,7 @@ impl Host {
         submitted: &mut u64,
         seen: &mut std::collections::HashSet<(usize, usize, usize)>,
     ) {
+        crate::zone!("card back");
         if plan.ranges.is_empty() {
             return;
         }
@@ -3670,6 +3675,7 @@ impl Host {
     /// Runs closed lists and waits for them, and with [`late`] for
     /// everything sent to the card before them, which is settled first.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        crate::zone!("execute lists");
         let _ = self.submit(runs, false);
     }
 
@@ -3680,6 +3686,7 @@ impl Host {
     /// ([`late`] lists those points); their host lists are reset and kept
     /// for reuse then, as a queue does for the lists it ran.
     pub(crate) fn execute_late(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>) {
+        crate::zone!("execute late");
         if order.is_empty() {
             crate::list::recycle(lists, &order);
             return;
@@ -3734,6 +3741,7 @@ impl Host {
     /// submission whose number comes back has finished ([`FINISHED`]); 0 if
     /// it ran and was waited for after all.
     fn execute_own(&self, list: &HostList) -> u64 {
+        crate::zone!("execute own");
         late_threads();
         let Some((submitted, sent)) = self.submit(&[list], true) else {
             return 0;
@@ -3776,6 +3784,7 @@ impl Host {
     /// the merge writes the copies' CPU side, which a flight still on the
     /// card may be writing too.
     fn settle(&self, submitted: &mut u64, why: usize) {
+        crate::zone!("settle");
         if !late() {
             return;
         }
@@ -3920,6 +3929,7 @@ impl Host {
     /// to be done once they have run comes back with the submission lock
     /// still held.
     fn submit<'a>(&'a self, runs: &[&HostList], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
+        crate::zone!("submit");
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -5157,6 +5167,7 @@ impl HostList {
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).
     fn run_deferred(&self, batch: &mut Batch) {
+        crate::zone!("deferred work");
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
@@ -5331,6 +5342,7 @@ impl Batch {
     }
 
     fn flush(&mut self) {
+        crate::zone!("refresh flush");
         self.index.clear();
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
@@ -5381,6 +5393,7 @@ impl Batch {
 /// cost about 2 ms per copy in the title's big pools (it walks the page
 /// tables to the region's end), which made copies run at 100-200 MB/s.
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
+    crate::zone!("copy mapped");
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
         1 => {
@@ -5903,6 +5916,10 @@ impl Meter {
                     per_frame(6) / 1e3
                 );
             }
+            crate::plot!("frame ms", ms);
+            crate::plot!("preparing ms", cpu);
+            crate::plot!("on the GPU ms", gpu);
+            crate::plot!("draws per frame", draws);
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
@@ -5984,6 +6001,7 @@ impl Host {
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+        crate::zone!("present to window");
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {

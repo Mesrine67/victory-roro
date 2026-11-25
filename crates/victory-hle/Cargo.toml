@@ -50,6 +50,8 @@ tempfile.workspace = true
 [features]
 # Debugging switches (scripted keys and the like).
 diagnostics = ["victory-gpu/diagnostics", "victory-loader/diagnostics", "dep:windows", "dep:windows-core"]
+# Tracy zones (see `victory-gpu/src/prof.rs`).
+tracy = ["victory-gpu/tracy"]
 
 [lints]
 workspace = true

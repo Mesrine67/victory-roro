@@ -382,6 +382,7 @@ fn record_clamp_as(
     (kind, stride, records): (u32, u32, u32),
     how: u32,
 ) -> bool {
+    crate::zone!("indirect clamp");
     let Some(bytes) = validate_layout(
         (kind, stride, records),
         src_offset,

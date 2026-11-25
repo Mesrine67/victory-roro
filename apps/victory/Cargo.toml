@@ -29,6 +29,9 @@ diagnostics = [
     "victory-loader/diagnostics",
     "victory-shader/diagnostics",
 ]
+# Hooks for the Tracy profiler: zones, frame marks, plots, the log lines and
+# sampled call stacks, sent to a Tracy 0.14.1 profiler on this machine.
+tracy = ["victory-core/tracy", "victory-hle/tracy"]
 
 [lints]
 workspace = true

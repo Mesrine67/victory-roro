@@ -38,6 +38,7 @@ mod inplace;
 pub mod list;
 pub mod object;
 pub mod pipeline;
+pub mod prof;
 #[cfg(windows)]
 mod primitive;
 pub mod query;

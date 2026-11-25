@@ -42,6 +42,26 @@ walkdir = "2.5.1"
 tempfile = "3.27.0"
 # Opus decoding for the console's audio decoder (BSD-3-Clause, pure Rust).
 opus-pure = "0.2.4"
+# The Tracy profiler's client (https://github.com/nagisa/rust_tracy_client),
+# built only with the `tracy` feature. tracy-client-sys 0.30 bundles Tracy
+# 0.14.1 (protocol 82): the profiler that views it must be 0.14.1 too, a
+# newer one refuses the connection. Without `crash-handler`: Tracy's would
+# sit in front of our own write-detection exception handler and end the
+# process at the first guarded write. `ondemand`: nothing is collected until
+# a profiler connects. `only-localhost`, no `broadcast`: not on the network.
+tracy-client = { version = "0.19.0", default-features = false, features = [
+    "enable",
+    "ondemand",
+    "only-localhost",
+    "system-tracing",
+    "context-switch-tracing",
+    "sampling",
+    "code-transfer",
+    "callstack-inlines",
+    "wait-stacks",
+] }
+tracy-client-sys = { version = "=0.30.1", default-features = false }
+tracing-tracy = { version = "0.12.0", default-features = false }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
@@ -76,3 +96,9 @@ debug = "line-tables-only"
 # kept in its own folder so it does not evict the plain release build.
 [profile.diag]
 inherits = "release"
+
+# The profiling build: the development build plus the Tracy profiler's hooks
+# (`cargo build --profile tracy -p victory --features diagnostics,tracy`), in
+# its own folder so benchmark runs keep using the build without them.
+[profile.tracy]
+inherits = "diag"

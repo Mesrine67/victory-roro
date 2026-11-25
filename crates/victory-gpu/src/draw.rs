@@ -1299,6 +1299,7 @@ impl State {
     /// copy. A list refreshes them where it first runs such a shader;
     /// title writes recorded later in the same list are not seen.
     fn heap_buffers(&self, list: &HostList) -> Option<u64> {
+        crate::zone!("heap buffers");
         let heap = self
             .heaps
             .iter()
@@ -1472,6 +1473,7 @@ impl State {
         heap: &crate::descriptor::Heap,
         host: &crate::descriptor::host::HostHeap,
     ) {
+        crate::zone!("heap textures");
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
             return;
@@ -2334,6 +2336,7 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        crate::zone!("indirect");
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
