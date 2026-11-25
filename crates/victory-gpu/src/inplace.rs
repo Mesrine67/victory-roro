@@ -67,7 +67,8 @@ pub(crate) fn probe_level() -> u8 {
 /// buffers that lies in private memory committed whole is not copied: a
 /// part of the title's allocation is opened as a host heap and the window
 /// is a buffer placed over it ([`place_for`]). 2: title buffers too,
-/// except the big ones in the card's memory.
+/// except the big ones in the card's memory. 3: those as well (for
+/// measuring: shaders then read them over the bus again).
 ///
 /// What it covers: private memory (`XMemVirtualAlloc`'s), by a heap opened
 /// on a part of the allocation; and view memory (the page pool) where the
@@ -136,10 +137,12 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
     Ok(Placed { buffer, heap, gpu, bias: start - at })
 }
 
-/// Since the start: placements made in the page pool's section (view
-/// memory that is one run of it) and their bytes; sections opened as a
-/// heap, and sections the host refused or that were made reserved.
-static POOL: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// Since the start: placements made in the page pool's sections (view
+/// memory that is one run of one) and their bytes; sections opened as a
+/// heap, and sections the host refused or that were made reserved; and
+/// placements whose pages were opened as a heap of their own through our
+/// view of the section.
+static POOL: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 /// The heaps opened on the title's page-pool sections, by the section's
 /// handle: each opened once, at the first placement in it, and kept (the
@@ -196,11 +199,61 @@ pub(crate) fn place_run(device: &ID3D12Device, section: usize, offset: u64, star
     let Some(from) = offset.checked_sub(bias).filter(|from| from % K64 as u64 == 0) else {
         return Err(None);
     };
-    let heap = section_heap(device, section)?;
+    let (heap, from) = match section_heap(device, section) {
+        Ok(heap) => (heap, from),
+        // The section as one heap was refused (run37: the card's driver
+        // takes 64 MB so and answers "the parameter is incorrect" to the
+        // 6,236 MB pool): the run's pages are opened as a heap of their own
+        // through a view of ours ([`section_view`]), as a part of private
+        // memory is.
+        Err(refused) => {
+            let Some(view) = section_view(section) else {
+                return Err(refused);
+            };
+            let heap = open(device, From::Part(view + from as usize, bytes as usize)).map_err(Some)?;
+            POOL[4].fetch_add(1, Ordering::Relaxed);
+            (heap, 0)
+        }
+    };
     let buffer = place(device, &heap, from, bytes).map_err(Some)?;
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() } + bias;
     Ok(Placed { buffer, heap, gpu, bias })
+}
+
+/// Views of our own of the title's page-pool sections, each whole and kept
+/// for good, by the section's handle (0: not to be had). A heap opened on
+/// a part of such a view shows the section's pages whatever the title
+/// does with its own views: it never unmaps ours, so none of its calls
+/// meets a heap in the way (the heap pins pages of the section, not the
+/// title's addresses).
+static SECTION_VIEWS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// The address of our view of `section`, mapped at the first call; `None`
+/// if the section was made reserved (its pages are committed through the
+/// title's views one by one, and a part with a page not committed is
+/// refused) or the mapping failed.
+fn section_view(section: usize) -> Option<usize> {
+    let mut mapped = SECTION_VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, at)) = mapped.iter().find(|m| m.0 == section) {
+        return (at != 0).then_some(at);
+    }
+    let known = views().sections.iter().find(|s| s.0 == section).map(|s| (s.1, s.2));
+    let at = match known {
+        // SAFETY: a section handle the runtime gave us and keeps open; the
+        // view is ours and is never unmapped.
+        Some((_, true)) => unsafe { mem::MapViewOfFile(section as _, mem::FILE_MAP_WRITE, 0, 0, 0).Value as usize },
+        _ => 0,
+    };
+    if let Some((bytes, true)) = known {
+        if at == 0 {
+            tracing::warn!(mb = bytes >> 20, error = %std::io::Error::last_os_error(), "title memory in place: no view of our own of the page pool's section");
+        } else {
+            tracing::info!("title memory in place: a view of our own of the page pool's section of {} MB at {at:#x}: its runs are opened part by part", bytes >> 20);
+        }
+    }
+    mapped.push((section, at));
+    (at != 0).then_some(at)
 }
 
 /// Title memory `[start, start + len)` in place, for a window outside
@@ -287,7 +340,7 @@ fn say() {
     tracing::info!(
         "title memory in place: {} windows {} MB, {} title buffers {} MB (no copy, no refresh, no copy-back); turned down: {} view memory in pieces or not private memory committed whole, \
          {} refused by the host, {} over VICTORY_INPLACE_MB; {} let go because their memory changed; in the page pool since the start: {} placements {} MB, \
-         {} sections opened as heaps, {} not opened (reserved without VICTORY_POOL_COMMIT=1, or refused)",
+         {} sections opened as heaps, {} not opened (reserved without VICTORY_POOL_COMMIT=1, or refused), {} placements opened part by part through our own view",
         s[0],
         s[1] >> 20,
         s[2],
@@ -299,7 +352,8 @@ fn say() {
         POOL[0].load(Ordering::Relaxed),
         POOL[1].load(Ordering::Relaxed) >> 20,
         POOL[2].load(Ordering::Relaxed),
-        POOL[3].load(Ordering::Relaxed)
+        POOL[3].load(Ordering::Relaxed),
+        POOL[4].load(Ordering::Relaxed)
     );
 }
 
@@ -1289,6 +1343,48 @@ mod tests {
             mem::UnmapViewOfFile2(process, view, 0);
             windows_sys::Win32::Foundation::CloseHandle(handle);
             windows_sys::Win32::Foundation::CloseHandle(reserved);
+        }
+    }
+
+    /// The pool's other path: the section as one heap was refused (as the
+    /// card's driver refuses the 6 GiB pool), so a run's pages are opened
+    /// as a heap of their own through our view of the section. The title's
+    /// view may then go while the buffer stands, which a heap opened on
+    /// the title's own addresses would not allow.
+    #[test]
+    fn warp_a_refused_section_is_opened_part_by_part_through_our_view() {
+        let Some(device) = warp() else { return };
+        if device.cast::<ID3D12Device13>().is_err() {
+            return;
+        }
+        const SIZE: usize = 32 * K64;
+        // SAFETY: a section, a placeholder and views of the test's own.
+        unsafe {
+            let process = windows_sys::Win32::System::Threading::GetCurrentProcess();
+            let invalid = windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+            let handle = mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, 0, SIZE as u32, std::ptr::null());
+            let hole = mem::VirtualAlloc2(process, std::ptr::null(), 4 * K64, mem::MEM_RESERVE | mem::MEM_RESERVE_PLACEHOLDER, mem::PAGE_NOACCESS, std::ptr::null_mut(), 0).cast::<u8>();
+            assert!(!handle.is_null() && !hole.is_null());
+            // Pages 20..24 of the section at the placeholder.
+            let view = mem::MapViewOfFile3(handle, process, hole.cast(), (20 * K64) as u64, 4 * K64, mem::MEM_REPLACE_PLACEHOLDER, mem::PAGE_READWRITE, std::ptr::null_mut(), 0);
+            assert_eq!(view.Value.cast::<u8>(), hole);
+            title_memory_section(handle as usize, SIZE as u64, true);
+            // As if the host had refused the section whole.
+            SECTION_HEAPS.lock().unwrap().push((handle as usize, None));
+            let (start, len) = (hole as u64 + K64 as u64 + 0x450, K64 as u64 + 77);
+            let placed = place_run(&device, handle as usize, 21 * K64 as u64 + 0x450, start, len).unwrap_or_else(|e| panic!("not placed: {e:?}"));
+            assert_eq!(placed.bias, 0x450);
+            assert_eq!(placed.buffer.GetDesc().Width, 2 * K64 as u64);
+            let mut rig = Rig::new(&device).unwrap();
+            fill(start as *mut u8, len as usize, 23);
+            let got = rig.fetch(&placed.buffer, placed.bias, len as usize).unwrap();
+            assert!(same(start as *const u8, &got), "the GPU reads the title's view through ours");
+            rig.store(&placed.buffer, placed.bias + 8, &[0x6d; 32]).unwrap();
+            assert!(same((start + 8) as *const u8, &[0x6d; 32]), "the GPU's write shows at the title's address");
+            // The title unmaps its view with the buffer standing.
+            assert_ne!(mem::UnmapViewOfFile2(process, view, mem::MEM_PRESERVE_PLACEHOLDER), 0, "the title's view goes freely");
+            drop(placed);
+            mem::VirtualFree(hole.cast(), 0, mem::MEM_RELEASE);
         }
     }
 
