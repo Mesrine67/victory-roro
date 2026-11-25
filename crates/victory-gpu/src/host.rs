@@ -3098,6 +3098,9 @@ impl Host {
             }
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
+        // Diagnostics: the last timestamp of the list that sends bytes up,
+        // from which the compare's list counts the title's own lists.
+        let mut sync_last: Option<u32> = None;
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
@@ -3110,6 +3113,12 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    // Diagnostics: the card's own time for the bytes sent
+                    // up and for the hash passes (`crate::cardstamps`).
+                    let mut timed = crate::cardstamps::Run::begin(&self.device, 2 * dirty.len() as u32 + 2);
+                    if let Some(timed) = timed.as_mut() {
+                        timed.mark(list, crate::cardstamps::NONE);
+                    }
                     for (shadow, ranges) in &dirty {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
@@ -3119,6 +3128,11 @@ impl Host {
                             crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
                         }
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
+                        if let Some(timed) = timed.as_mut()
+                            && !ranges.is_empty()
+                        {
+                            timed.mark(list, crate::cardstamps::SENT_UP);
+                        }
                         let Some(before) = before else {
                             continue;
                         };
@@ -3154,6 +3168,15 @@ impl Host {
                             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                             list.Dispatch(run.pieces.div_ceil(64), 1, 1);
                         }
+                        if let Some(timed) = timed.as_mut() {
+                            timed.mark(list, crate::cardstamps::REHASH);
+                        }
+                    }
+                    if let Some(mut timed) = timed {
+                        // The hash passes still running count as theirs.
+                        crate::cardstamps::wait_for_writes(list);
+                        timed.mark(list, crate::cardstamps::REHASH);
+                        sync_last = timed.end(list);
                     }
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
@@ -3226,6 +3249,14 @@ impl Host {
                             }),
                         },
                     }]);
+                    // Diagnostics: the submission's lists have run here (the
+                    // wait above), and the compare starts.
+                    let mut timed = crate::cardstamps::Run::begin(&self.device, 2);
+                    if let Some(timed) = timed.as_mut() {
+                        timed.after(sync_last);
+                        let kind = if sync_last.is_some() { crate::cardstamps::TITLE } else { crate::cardstamps::NONE };
+                        timed.mark(list, kind);
+                    }
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
@@ -3239,6 +3270,11 @@ impl Host {
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
                         list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
+                    }
+                    if let Some(mut timed) = timed {
+                        crate::cardstamps::wait_for_writes(list);
+                        timed.mark(list, crate::cardstamps::COMPARE);
+                        timed.end(list);
                     }
                     list.Close()?;
                     list.cast()
@@ -3382,8 +3418,17 @@ impl Host {
             (|| -> windows::core::Result<u64> {
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
+                // Diagnostics: the card's own time for the fetch.
+                let mut timed = crate::cardstamps::Run::begin(&self.device, 2);
+                if let Some(timed) = timed.as_mut() {
+                    timed.mark(&list, crate::cardstamps::NONE);
+                }
                 for (shadow, lo, hi, at) in &pieces {
                     list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                }
+                if let Some(mut timed) = timed {
+                    timed.mark(&list, crate::cardstamps::FETCH);
+                    timed.end(&list);
                 }
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
@@ -5912,6 +5957,29 @@ impl Meter {
                 "our passes over copies in the card's memory per frame: {card_passes:.0} hash passes over {card_pieces:.0} pieces after \
                  ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {card_compares:.0} compare passes",
                 if rehash_runs() { "on" } else { "off" }
+            );
+        }
+        if crate::cardstamps::on() {
+            use crate::cardstamps::{COMPARE, FETCH, REHASH, SENT_UP, TITLE};
+            let (sums, lists) = crate::cardstamps::take(std::time::Duration::from_secs(2));
+            // SAFETY: a plain query.
+            let frequency = host().and_then(|h| unsafe { h.queue.GetTimestampFrequency() }.ok()).unwrap_or(1).max(1) as f64;
+            let ms = |kind: u8| sums[usize::from(kind)].1 as f64 * 1e3 / frequency / frames;
+            let n = |kind: u8| sums[usize::from(kind)].0 as f64 / frames;
+            tracing::info!(
+                "the card's own time for our passes per frame (VICTORY_CARD_STAMPS=1, {lists} timed lists): sending bytes up {:.1} ms in {:.0} copies, \
+                 hashing them again {:.1} ms in {:.0} steps, comparing after the lists {:.1} ms in {:.1} lists, fetching the pieces that differ \
+                 {:.1} ms in {:.1} lists; the title's own lists between ours {:.1} ms in {:.1} submissions",
+                ms(SENT_UP),
+                n(SENT_UP),
+                ms(REHASH),
+                n(REHASH),
+                ms(COMPARE),
+                n(COMPARE),
+                ms(FETCH),
+                n(FETCH),
+                ms(TITLE),
+                n(TITLE)
             );
         }
         let [own, asking, still, texture_refresh_ms] =

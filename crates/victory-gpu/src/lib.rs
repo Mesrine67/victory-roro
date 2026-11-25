@@ -19,6 +19,7 @@
 mod callers;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+mod cardstamps;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
