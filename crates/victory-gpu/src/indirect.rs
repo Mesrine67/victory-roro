@@ -930,7 +930,8 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                // One group per piece.
+                warp.list.Dispatch(PIECES, 1, 1);
             }
             warp.submit_and_wait();
             // SAFETY: as above.
@@ -958,6 +959,111 @@ void main() {
         set(content[at]);
         assert_eq!(run(&mut warp, 2), [0, 1, 0]);
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+    }
+
+    /// The compare hashes a piece with 64 threads, a kilobyte each: a
+    /// change in any thread's kilobyte is found, in the piece it is in and
+    /// in no other, also at the ends of a copy that starts in the middle of
+    /// its first piece, and so are two kilobytes that change places. With
+    /// a start that is no multiple of 16 bytes the pieces are widened to
+    /// one, so a change next to a cut may flag the piece beside it as well
+    /// (a fetch that finds nothing), and always flags its own.
+    #[test]
+    fn warp_card_compare_finds_a_change_in_every_kilobyte() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        const PIECE: usize = 64 << 10;
+        // A copy of three buffers of 64 KiB that starts inside its first
+        // piece: four pieces, the first and the last in part.
+        const PIECES: u32 = 4;
+        let size = 3 * PIECE;
+        let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
+        let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES));
+        let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
+        let content: Vec<u8> = (0..size).map(|i| (i * 131 + i / 7 + (i >> 9) * 29) as u8).collect();
+        // SAFETY: the mapping holds `size` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
+        let run = |warp: &mut WarpHarness, skew: usize, mode: u32| -> [u32; 4] {
+            // SAFETY: our open list, live buffers, the compare's own root
+            // signature; the mappings hold what is read and written.
+            unsafe {
+                for piece in 0..PIECES as usize {
+                    differs_ptr.cast::<u32>().add(piece).write_volatile(7);
+                }
+                warp.list.SetComputeRootSignature(&compare.root);
+                warp.list.SetPipelineState(&compare.pso);
+                let constants = [0u32, skew as u32, size as u32, PIECES, 0, mode];
+                warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                warp.list.Dispatch(PIECES, 1, 1);
+            }
+            warp.submit_and_wait();
+            // SAFETY: as above.
+            [0, 1, 2, 3].map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() })
+        };
+        // SAFETY (each): inside the mapping.
+        let flip = |at: usize, on: bool| unsafe { now_ptr.add(at).write_volatile(content[at] ^ u8::from(on)) };
+
+        // A start at a multiple of 16 bytes: each change flags its piece
+        // and no other.
+        let skew = 0x1230;
+        let flags_for = |at: usize| {
+            let mut flags = [0u32; 4];
+            flags[(at + skew) / PIECE] = 1;
+            flags
+        };
+        assert_eq!(run(&mut warp, skew, 0), [7, 7, 7, 7]);
+        assert_eq!(run(&mut warp, skew, 2), [0, 0, 0, 0]);
+        // A byte in every kilobyte of the second piece (a whole one); then
+        // the copy's first and last bytes and both sides of every cut.
+        let second = PIECE - skew;
+        let mut places: Vec<usize> = (0..64).map(|k| second + k * 1024 + (k * 37) % 1024).collect();
+        places.extend([0, 1, size - 1, size - 16, size - 17]);
+        for cut in [PIECE - skew, 2 * PIECE - skew, 3 * PIECE - skew] {
+            places.extend([cut - 1, cut]);
+        }
+        for at in places {
+            flip(at, true);
+            assert_eq!(run(&mut warp, skew, 2), flags_for(at), "a change at {at:#x}");
+            assert_eq!(run(&mut warp, skew, 2), [0, 0, 0, 0], "nothing after the change at {at:#x}");
+            flip(at, false);
+            assert_eq!(run(&mut warp, skew, 2), flags_for(at), "the change back at {at:#x}");
+        }
+        // Two kilobytes of the third piece change places: the bytes are
+        // the same, where they lie is not.
+        let (a, b) = (2 * PIECE - skew + 3 * 1024, 2 * PIECE - skew + 40 * 1024);
+        assert_ne!(content[a..a + 1024], content[b..b + 1024]);
+        // SAFETY: inside the mapping, and the two do not overlap.
+        unsafe {
+            std::ptr::copy_nonoverlapping(content[b..].as_ptr(), now_ptr.add(a), 1024);
+            std::ptr::copy_nonoverlapping(content[a..].as_ptr(), now_ptr.add(b), 1024);
+        }
+        assert_eq!(run(&mut warp, skew, 2), [0, 0, 1, 0]);
+        // SAFETY: the mapping holds `size` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
+
+        // A start that is no multiple of 16 bytes: the piece a change is
+        // in is always flagged, and at most the one beside it as well.
+        let skew = 0x1234;
+        assert_eq!(run(&mut warp, skew, 0), [7, 7, 7, 7]);
+        assert_eq!(run(&mut warp, skew, 2), [0, 0, 0, 0]);
+        let mut places = vec![0, size - 1];
+        for cut in [PIECE - skew, 2 * PIECE - skew, 3 * PIECE - skew] {
+            places.extend([cut - 13, cut - 1, cut, cut + 3, cut + 500, cut - 500]);
+        }
+        for at in places {
+            flip(at, true);
+            let flags = run(&mut warp, skew, 2);
+            assert_eq!(flags[(at + skew) / PIECE], 1, "a change at {at:#x}: {flags:?}");
+            assert!(flags.iter().sum::<u32>() <= 2, "a change at {at:#x}: {flags:?}");
+            assert_eq!(run(&mut warp, skew, 2), [0, 0, 0, 0], "nothing after the change at {at:#x}");
+            flip(at, false);
+            assert_eq!(run(&mut warp, skew, 2)[(at + skew) / PIECE], 1, "the change back at {at:#x}");
+        }
     }
 
     /// The clamp compiles with the system's compiler and the host takes it.

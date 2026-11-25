@@ -1512,18 +1512,31 @@ unsafe impl Send for CardWork {}
 static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
 
 /// The compare of a declared range of a copy in the card's memory with
-/// its bytes from before, one thread per 64 KiB piece (cut at multiples of
-/// 64 KiB of title memory, as `Shadow::card_piece` cuts them): `differs`
-/// gets a dword per piece, 1 where a byte differs. The offsets are widened
-/// to 16 bytes; buffers are multiples of 64 KiB, and a piece flagged for a
-/// byte just outside the range costs a fetch that finds nothing.
+/// its bytes from before, one group of 64 threads per 64 KiB piece (cut at
+/// multiples of 64 KiB of title memory, as `Shadow::card_piece` cuts them):
+/// `differs` gets a dword per piece, 1 where a byte differs. The offsets are
+/// widened to 16 bytes; buffers are multiples of 64 KiB, and a piece flagged
+/// for a byte just outside the range costs a fetch that finds nothing.
+///
+/// Each thread hashes a kilobyte of the piece (the last one what is left),
+/// 64 steps one after the other, and the first adds the 64 hashes up. One
+/// thread per piece walked its 4,096 steps alone, so a pass took the time
+/// of a whole piece however few its pieces were, with the card all but
+/// idle: some 350 such passes a frame in the room, 30 ms of the card's 136
+/// busy ms by its own timestamps (`crate::cardstamps`, run fb_stamps1:
+/// hashing after sends 17.1 ms, comparing 13.3 ms). A thread's hash starts
+/// from a value of its own place in the piece, so the same bytes elsewhere
+/// in the piece hash otherwise; a change of one 16-byte word always changes
+/// its thread's hash (each step maps the state one to one), and so the sum.
+///
+/// The host dispatches one group per piece ([`card_dispatch`]).
 pub(crate) const CARD_COMPARE: &str = r#"
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
 cbuffer Span : register(b0) {
     uint first;    // the first piece
     uint skew;     // where the copy starts in its piece 0
     uint size;     // the copy's buffer, in bytes (a multiple of 64 KiB)
-    uint pieces;
+    uint pieces;   // as many groups are dispatched
     uint out_at;   // the first piece's dword in `differs`, in bytes
     uint compare;  // 0: the hashes are stored; else compared with those stored (2: and then stored)
 };
@@ -1532,45 +1545,96 @@ ByteAddressBuffer now : register(t0);
 // last sent up (or hashed whole, the first time).
 RWByteAddressBuffer hashes : register(u0);
 RWByteAddressBuffer differs : register(u1);
+groupshared uint4 part[64];
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= pieces) return;
-    uint piece = first + id.x;
+void main(uint3 group : SV_GroupID, uint lane : SV_GroupIndex) {
+    uint piece = first + group.x;
     uint lo = piece * 65536u;
     lo = lo > skew ? lo - skew : 0u;
     uint hi = min((piece + 1u) * 65536u - skew, size);
     lo = lo & ~15u;
     hi = (hi + 15u) & ~15u;
-    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
+    // This thread's kilobyte; the last thread takes the rest (the widening
+    // above makes a piece 16 bytes longer than 64 KiB where the copy does
+    // not start at a multiple of 16).
+    uint from = min(lo + lane * 1024u, hi);
+    uint to = lane == 63u ? hi : min(from + 1024u, hi);
+    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu)
+        ^ ((lane + 1u) * uint4(0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du, 0x27D4EB2Fu));
     [loop]
-    for (uint at = lo; at < hi; at += 16u) {
+    for (uint at = from; at < to; at += 16u) {
         h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
         h = h.yzwx ^ (h >> 15);
     }
+    part[lane] = h;
+    GroupMemoryBarrierWithGroupSync();
+    if (lane != 0u) return;
+    uint4 sum = uint4(0u, 0u, 0u, 0u);
+    for (uint i = 0u; i < 64u; i++) {
+        sum += part[i];
+    }
     if (compare != 0u) {
-        differs.Store(out_at + id.x * 4u, any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
+        differs.Store(out_at + group.x * 4u, any(sum != hashes.Load4(piece * 16u)) ? 1u : 0u);
         // With the copy-back on its own thread: the next compare of the
         // piece finds what is written from here on.
-        if (compare == 2u) hashes.Store4(piece * 16u, h);
+        if (compare == 2u) hashes.Store4(piece * 16u, sum);
     } else {
-        hashes.Store4(piece * 16u, h);
+        hashes.Store4(piece * 16u, sum);
     }
 }
 "#;
+
+/// The most groups one dispatch takes in a dimension.
+const CARD_GROUPS: u32 = 65_535;
+
+/// The parts a pass of [`CARD_COMPARE`] over `pieces` pieces from `first`
+/// is dispatched in, as (first piece, pieces, the first's dword in the
+/// results in bytes): one group per piece, and no more groups in a
+/// dispatch than the host runs. (A copy in the card's memory is under
+/// 1 GiB, 16,384 pieces, so one part; the cut is for whatever changes
+/// that.)
+fn card_parts(first: u32, pieces: u32, out_at: u32) -> impl Iterator<Item = (u32, u32, u32)> {
+    (0..pieces.div_ceil(CARD_GROUPS)).map(move |part| {
+        let done = part * CARD_GROUPS;
+        (first + done, (pieces - done).min(CARD_GROUPS), out_at + done * 4)
+    })
+}
+
+/// Records a pass of [`CARD_COMPARE`] into `list`, whose compute root
+/// signature, pipeline and views are the compare's: `constants` as the
+/// shader names them (first piece, skew, size, pieces, results offset,
+/// mode).
+///
+/// # Safety
+///
+/// `list` is an open list with the compare's root signature and pipeline
+/// set, and live buffers at its three views.
+unsafe fn card_dispatch(list: &ID3D12GraphicsCommandList, constants: [u32; 6]) {
+    let [first, skew, size, pieces, out_at, mode] = constants;
+    for (first, pieces, out_at) in card_parts(first, pieces, out_at) {
+        let constants = [first, skew, size, pieces, out_at, mode];
+        // SAFETY: the caller's.
+        unsafe {
+            list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+            list.Dispatch(pieces, 1, 1);
+        }
+    }
+}
 
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in runs of pieces that touch, each piece
 /// once (`VICTORY_CARD_REHASH_RUNS=1`; off by default), and not in a pass
 /// per range sent up.
 ///
-/// These passes are ours, they run on the card before every submission's
-/// lists, and no timing so far names them: each walks its 64 KiB pieces
-/// 16 bytes at a time, 4,096 steps one after the other, so a pass takes
-/// the time of one piece however few its pieces are. Run 102 sent up 514
-/// ranges a frame: 514 such passes. The same pieces are hashed either way;
-/// a piece hashed when it need not be, or not hashed when it should, costs
-/// a fetch that finds nothing and loses no shader write.
+/// These passes are ours and run on the card before every submission's
+/// lists. While a thread walked a whole 64 KiB piece, 4,096 steps one
+/// after the other, a pass took the time of one piece however few its
+/// pieces were, and run 102 sent up 514 ranges a frame: 514 such passes.
+/// (A piece is now hashed by 64 threads, see [`CARD_COMPARE`]; fewer
+/// passes are still fewer dispatches.) The same pieces are hashed either
+/// way; a piece hashed when it need not be, or not hashed when it should,
+/// costs a fetch that finds nothing and loses no shader write.
 fn rehash_runs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_some_and(|v| v == "1"))
@@ -1891,6 +1955,29 @@ fn landable(line: &[Option<u64>], completed: u64) -> usize {
 /// flag it.
 fn flagged_pieces(flags: &[(usize, u32, bool)]) -> std::collections::HashSet<(usize, u32)> {
     flags.iter().filter(|f| f.2).map(|f| (f.0, f.1)).collect()
+}
+
+#[cfg(test)]
+mod card_dispatch_tests {
+    use super::{CARD_GROUPS, card_parts};
+
+    /// A pass over a copy's pieces is one dispatch of a group per piece;
+    /// past the most groups a dispatch takes it is cut, each part with its
+    /// own first piece and place in the results.
+    #[test]
+    fn a_pass_is_cut_at_the_most_groups_a_dispatch_takes() {
+        assert_eq!(card_parts(5, 0, 8).count(), 0);
+        assert_eq!(card_parts(5, 3, 8).collect::<Vec<_>>(), [(5, 3, 8)]);
+        assert_eq!(card_parts(0, CARD_GROUPS, 0).collect::<Vec<_>>(), [(0, CARD_GROUPS, 0)]);
+        assert_eq!(
+            card_parts(10, 2 * CARD_GROUPS + 7, 40).collect::<Vec<_>>(),
+            [
+                (10, CARD_GROUPS, 40),
+                (10 + CARD_GROUPS, CARD_GROUPS, 40 + 4 * CARD_GROUPS),
+                (10 + 2 * CARD_GROUPS, 7, 40 + 8 * CARD_GROUPS)
+            ]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3164,9 +3251,7 @@ impl Host {
                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
                         for run in runs {
-                            let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
-                            list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                            list.Dispatch(run.pieces.div_ceil(64), 1, 1);
+                            card_dispatch(list, [run.first, run.skew, size as u32, run.pieces, 0, 0]);
                         }
                         if let Some(timed) = timed.as_mut() {
                             timed.mark(list, crate::cardstamps::REHASH);
@@ -3265,10 +3350,9 @@ impl Host {
                             continue;
                         };
                         let constants = [r.span.first, r.span.skew, size as u32, r.span.pieces, r.at * 4, if flown { 2 } else { 1 }];
-                        list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
+                        card_dispatch(list, constants);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     if let Some(mut timed) = timed {
