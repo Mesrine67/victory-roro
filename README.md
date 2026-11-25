@@ -63,8 +63,29 @@ writes `logs\<date_time>\err.txt` (the runtime's log), `out.txt` and `run.txt`.
 
 ## Windows 10
 
-The runtime uses the system's Direct3D 12. Windows 10's does not provide Shader Model 6.6, which the game needs, and
-`victory.exe` does not load the D3D12 Agility SDK yet, so Windows 11 is required for now.
+Windows 10's own Direct3D 12 stops at Shader Model 6.5, so every translated pipeline is refused and nothing draws.
+Microsoft's D3D12 Agility SDK runtime fixes that (Windows 10 20H2 or later, a current GPU driver). One extra command
+before building:
+
+```powershell
+cargo xtask agility                                                  # downloads it, checks its SHA-512
+cargo build --locked --profile diag -p victory --features diagnostics   # build after it, not before
+```
+
+`cargo xtask agility` fetches the pinned NuGet package `Microsoft.Direct3D.D3D12` 1.620.2 from nuget.org, checks the
+SHA-512 nuget.org publishes, and puts `D3D12Core.dll` and `d3d12SDKLayers.dll` in `target\<profile>\D3D12\`. The next
+build of `victory.exe` then asks D3D12 to load them. Without that folder the exe asks for nothing, so Windows 11 needs
+no step. The DLLs never enter the repository.
+
+From [fxceless/victory-fork#402](https://github.com/fxceless/victory-fork/pull/402) by domints. Checked on Windows 11
+(the game runs with the Agility runtime beside it, 2026-11-25); please report how it goes on Windows 10.
+
+## NVIDIA cards with 8 GB
+
+This build is measured on cards with 12 GB or more (RX 6700 XT, and RTX 5060 Ti / 4070 Ti in shadowdog00's tests). On
+an 8 GB NVIDIA card the textures do not fit: use
+[soldsawn/victory-nvidia-8gb](https://github.com/soldsawn/victory-nvidia-8gb), tuned and measured on an RTX 4060 Laptop
+8 GB (`VICTORY_TEXTURE_DROP_MIPS=2`, `VICTORY_RESOLUTION=1920x1080`).
 
 ## License
 

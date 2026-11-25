@@ -64,9 +64,21 @@ needed, make it, build, and have the user run `play.ps1` again; compare the new 
 
 ## Windows 10
 
-The runtime uses the system's Direct3D 12. Windows 10's does not provide Shader Model 6.6, which the game needs; the
-D3D12 Agility SDK would, but `victory.exe` does not export `D3D12SDKVersion` / `D3D12SDKPath` yet, so dropping
-`D3D12Core.dll` into a `D3D12` folder has no effect. Until that is added, Windows 11 is required.
+Windows 10's Direct3D 12 stops at Shader Model 6.5 (the log says `the device supports SM 0x65 only`, every pipeline
+is refused, nothing draws). Fix, with the user's agreement (it downloads Microsoft's package from nuget.org):
+
+1. `cargo xtask agility`: fetches `Microsoft.Direct3D.D3D12` 1.620.2, checks its SHA-512, puts `D3D12Core.dll` and
+   `d3d12SDKLayers.dll` in `target\<profile>\D3D12\`.
+2. Rebuild `victory.exe` **after** step 1: its build script exports `D3D12SDKVersion = 620` / `D3D12SDKPath` only when
+   the DLL is there (with the exports and no DLL, D3D12 device creation fails).
+3. Windows 10 must be 20H2 or later with a current GPU driver. Copying DLLs by hand, or another SDK version, does not work.
+
+Windows 11 needs none of this.
+
+## NVIDIA cards with 8 GB
+
+Textures do not fit 8 GB in this build. Point the user to https://github.com/soldsawn/victory-nvidia-8gb (tuned for
+an RTX 4060 8 GB: `VICTORY_TEXTURE_DROP_MIPS=2`, `VICTORY_RESOLUTION=1920x1080`).
 
 ## Reporting a problem upstream
 
