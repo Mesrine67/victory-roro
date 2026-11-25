@@ -105,6 +105,12 @@ pub extern "system" fn VirtualAlloc(
         entry.0 += 1;
         entry.1 += size as u64;
     }
+    first(|| {
+        tracing::info!(
+            "the title's own VirtualAlloc: {size:#x} bytes at {address:p}, kind {kind:#x}, protection {protect:#x}              (given to Windows as {:#x}): {at:p}",
+            cleaned(protect)
+        )
+    });
     say();
     at
 }
@@ -125,8 +131,24 @@ pub extern "system" fn VirtualFree(address: *mut c_void, size: usize, kind: u32)
     if freed == 0 {
         COUNTS[FAILED].fetch_add(1, Relaxed);
     }
+    first(|| tracing::info!("the title's own VirtualFree: {address:p}, size {size:#x}, kind {kind:#x}: {freed}"));
     say();
     freed
+}
+
+/// The first calls, each on a line of its own: a title that asks a few
+/// times at its start and never again leaves no ten-second line.
+fn first(line: impl FnOnce()) {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    if CALLS.fetch_add(1, Relaxed) >= 32 {
+        return;
+    }
+    // SAFETY: plain thread state; writing the log may change it, and the
+    // title reads it after the call this runs in.
+    let error = unsafe { GetLastError() };
+    line();
+    // SAFETY: as above.
+    unsafe { SetLastError(error) };
 }
 
 /// The line of what the title asked, every ten seconds in which it asked
