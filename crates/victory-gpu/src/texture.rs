@@ -60,6 +60,9 @@ pub(crate) struct Staging {
     uploaded: std::sync::atomic::AtomicBool,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
+    /// Its range of a block of upload memory ([`upload_memory`]), given
+    /// back when the submissions started by then have run.
+    piece: Option<Piece>,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -399,6 +402,10 @@ impl Drop for Staging {
         use std::sync::atomic::Ordering::Relaxed;
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
+        // A list the card has not run yet may still copy from the range.
+        if let Some(piece) = self.piece.take() {
+            crate::host::retire(piece);
+        }
     }
 }
 
@@ -1086,6 +1093,91 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     there
 }
 
+/// Whether staging memory is cut from big upload buffers
+/// (`VICTORY_STAGING_POOL=0`: a committed buffer per texture, as before).
+fn pooled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STAGING_POOL").is_none_or(|v| v != "0"))
+}
+
+/// The size of a block of upload memory staging buffers are cut from, and
+/// the unit they are cut on (a page; copies want 512).
+const BLOCK: u64 = 64 << 20;
+const GRAIN: u64 = 4096;
+
+/// A block of upload memory, mapped for its life, and what is free in it.
+struct Block {
+    buffer: ID3D12Resource,
+    data: usize,
+    ranges: crate::ranges::Ranges,
+}
+// SAFETY: a free-threaded D3D12 object and the address of its mapping.
+unsafe impl Send for Block {}
+
+/// The blocks, never given back to the host (their ranges are).
+static BLOCKS: Mutex<Vec<Block>> = Mutex::new(Vec::new());
+/// Staging buffers cut from blocks and their bytes, and blocks made, since
+/// the start.
+pub(crate) static POOLED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// A staging buffer's range of a block; dropping it gives the range back.
+struct Piece {
+    block: usize,
+    offset: u64,
+    len: u64,
+}
+
+impl Drop for Piece {
+    fn drop(&mut self) {
+        let mut blocks = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(block) = blocks.get_mut(self.block) {
+            block.ranges.give(self.offset, self.len);
+        }
+    }
+}
+
+/// Upload memory for a staging buffer of `total` bytes: the buffer and its
+/// mapping, the offset of the staging buffer's first byte in both, and its
+/// range if it was cut from a block. A committed upload buffer per texture
+/// was most of what the pass over textures picked by index did in the
+/// opening cutscene: 1,000-2,200 of them a frame at about 0.5 ms each, the
+/// host mapping each into the process while the title remapped its own
+/// memory (run `dl_diag1`). Buffers of a quarter block and more are still
+/// made each on its own.
+fn upload_memory(total: u64) -> Option<(ID3D12Resource, *mut u8, u64, Option<Piece>)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let host = host()?;
+    let len = total.max(1).next_multiple_of(GRAIN);
+    if !pooled() || len > BLOCK / 4 {
+        let (buffer, data) = host.upload_buffer(total)?;
+        return Some((buffer, data, 0, None));
+    }
+    let mut blocks = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    // The newest block first: the older ones are full but for holes.
+    let found = blocks
+        .iter_mut()
+        .enumerate()
+        .rev()
+        .find_map(|(i, b)| b.ranges.take(len, GRAIN).map(|offset| (i, offset)));
+    let (block, offset) = match found {
+        Some(found) => found,
+        None => {
+            let (buffer, data) = host.upload_buffer(BLOCK)?;
+            let index = blocks.len();
+            crate::host::name(&buffer, || format!("staging block {index}"));
+            let mut ranges = crate::ranges::Ranges::new(BLOCK);
+            let offset = ranges.take(len, GRAIN)?;
+            blocks.push(Block { buffer, data: data as usize, ranges });
+            POOLED[2].fetch_add(1, Relaxed);
+            (index, offset)
+        }
+    };
+    POOLED[0].fetch_add(1, Relaxed);
+    POOLED[1].fetch_add(len, Relaxed);
+    let b = &blocks[block];
+    Some((b.buffer.clone(), b.data as *mut u8, offset, Some(Piece { block, offset, len })))
+}
+
 /// The staging state of a title texture from mip `first` on, made on first
 /// use (and made anew for larger mips than the one there holds).
 fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<Staging>> {
@@ -1141,15 +1233,20 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
         );
     }
     let making = std::time::Instant::now();
-    let (buffer, data) = host.upload_buffer(total)?;
+    let (buffer, data, base, piece) = upload_memory(total)?;
+    for footprint in &mut footprints {
+        footprint.Offset += base;
+    }
     STAGING_MADE[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGING_MADE[1].fetch_add(making.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
-    crate::host::name(&buffer, || {
-        format!(
-            "staging of {resource:?} {}x{}x{} f{}",
-            d.Width, d.Height, d.DepthOrArraySize, d.Format.0
-        )
-    });
+    if piece.is_none() {
+        crate::host::name(&buffer, || {
+            format!(
+                "staging of {resource:?} {}x{}x{} f{}",
+                d.Width, d.Height, d.DepthOrArraySize, d.Format.0
+            )
+        });
+    }
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
@@ -1170,6 +1267,7 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
+        piece,
     });
     map.insert(resource as usize, s.clone());
     Some(s)

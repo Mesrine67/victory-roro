@@ -6187,6 +6187,23 @@ impl Meter {
         {
             let p: [f64; 7] = std::array::from_fn(|i| crate::draw::HEAP_TEXTURE_PHASES[i].swap(0, Ordering::Relaxed) as f64 / frames);
             let s = [0, 1].map(|i| crate::texture::STAGING_MADE[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            let t = [0, 1, 2, 3].map(|i| crate::resource::TEXTURES_MADE[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if t[0] + t[2] >= 1.0 {
+                tracing::info!(
+                    "host textures made per frame: {:.0} committed in {:.1} ms, {:.0} placed in heaps in {:.1} ms ({} heaps of 256 MB so far with {} MB free in them, {} placed textures still held after their release); \
+                     staging buffers cut from blocks so far: {} ({} MB, {} blocks of 64 MB)",
+                    t[0],
+                    t[1] / 1e3,
+                    t[2],
+                    t[3] / 1e3,
+                    crate::resource::TEXTURES_MADE[4].load(Ordering::Relaxed),
+                    crate::resource::HEAP_FREE.load(Ordering::Relaxed) >> 20,
+                    crate::resource::LEAVING_NOW.load(Ordering::Relaxed),
+                    crate::texture::POOLED[0].load(Ordering::Relaxed),
+                    crate::texture::POOLED[1].load(Ordering::Relaxed) >> 20,
+                    crate::texture::POOLED[2].load(Ordering::Relaxed)
+                );
+            }
             if p[5] >= 1000.0 {
                 tracing::info!(
                     "textures picked by index, the pass per frame: {:.1} ms over {:.0} slots: {:.1} ms asking what is mapped, {:.1} ms making \

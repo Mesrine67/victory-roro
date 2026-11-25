@@ -1125,6 +1125,9 @@ pub(crate) struct HostTexture {
     /// Whether its contents come from title memory ([`fills`]): counted in
     /// [`KINDS`] while it lives.
     filled: bool,
+    /// Its range of a texture heap ([`placed_texture`]), given back when
+    /// the submissions started by then have run.
+    cut: Option<Cut>,
 }
 
 /// What a title texture has on the host: its host copy and, for a depth
@@ -1303,7 +1306,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             .clear
             .as_ref()
             .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
-        let Some(texture) = host_texture(&r.desc, r.host.state, clear) else {
+        let Some((texture, cut)) = host_texture(&r.desc, r.host.state, clear) else {
             r.host.refused.store(true, Relaxed);
             return None;
         };
@@ -1321,6 +1324,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         }
         let state = crate::host::legal_state(&texture, crate::host::texture_state(r.host.state));
         let mut host = HostTexture::new(texture, state);
+        host.cut = cut;
         host.filled = fills(&r.desc);
         if host.filled {
             KINDS[0].fetch_add(1, Relaxed);
@@ -1378,8 +1382,13 @@ pub(crate) fn room() -> bool {
     if filled < FLOOR {
         return true;
     }
+    // Placed textures nothing holds any more give their ranges back here
+    // too: with no room nothing is placed, which is where else it is done.
+    sweep_leaving();
     match crate::host::host().and_then(|h| h.video_memory()) {
-        Some([budget, used, ..]) => used < budget / 10 * 9,
+        // What is free in the texture heaps is room, though the system
+        // counts it as in use.
+        Some([budget, used, ..]) => used.saturating_sub(HEAP_FREE.load(Relaxed)) < budget / 10 * 9,
         None => filled < WITHOUT_BUDGET,
     }
 }
@@ -1550,6 +1559,7 @@ impl HostTexture {
             state: std::sync::atomic::AtomicU32::new(state),
             bytes,
             filled: false,
+            cut: None,
         }
     }
 }
@@ -1563,6 +1573,14 @@ impl Drop for HostTexture {
         if self.filled {
             KINDS[0].fetch_sub(1, Relaxed);
             KINDS[1].fetch_sub(self.bytes, Relaxed);
+        }
+        // Host slots and lists hold the texture itself past this (a slot
+        // goes on showing a streamed texture's old view until the new one
+        // is uploaded): the range is given back when they let go of it.
+        if let Some(cut) = self.cut.take() {
+            let mut leaving = LEAVING.lock().unwrap_or_else(|e| e.into_inner());
+            leaving.push(Leaving(self.texture.clone(), cut));
+            LEAVING_NOW.store(leaving.len() as u64, Relaxed);
         }
     }
 }
@@ -1614,6 +1632,212 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     hosted(this, true).map(|made| made.0)
 }
 
+/// Whether plain host textures are placed in big heaps
+/// (`VICTORY_TEXTURE_HEAPS=0`: a committed resource each, as before).
+#[cfg(windows)]
+fn texture_heaps() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_HEAPS").is_none_or(|v| v != "0"))
+}
+
+/// The size of a heap plain host textures are placed in.
+#[cfg(windows)]
+const TEXTURE_HEAP: u64 = 256 << 20;
+
+/// A heap of the card's memory for plain textures, and what is free in it.
+#[cfg(windows)]
+struct TextureHeap {
+    heap: windows::Win32::Graphics::Direct3D12::ID3D12Heap,
+    ranges: crate::ranges::Ranges,
+}
+// SAFETY: a free-threaded D3D12 object.
+#[cfg(windows)]
+unsafe impl Send for TextureHeap {}
+
+/// The heaps, never given back to the host (their ranges are).
+#[cfg(windows)]
+static TEXTURE_HEAPS: std::sync::Mutex<Vec<TextureHeap>> = std::sync::Mutex::new(Vec::new());
+
+/// Host textures made since the frame line last asked: committed ones and
+/// their microseconds, placed ones and theirs; then heaps made since the
+/// start.
+pub(crate) static TEXTURES_MADE: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// Bytes of the texture heaps that no texture is placed in. The system
+/// counts a heap whole as the card's memory in use, whatever is placed in
+/// it: [`room`] takes these off. (Runs `pool_try1`, `pool_try2` and
+/// `pool_heapsonly` did not: the heaps filled the card to nine tenths in
+/// the cutscene's first seconds, the textures let go after that freed
+/// ranges and not the card's memory, and 18,000 slots waited for room for
+/// the rest of the run - black faces and shirts.)
+pub(crate) static HEAP_FREE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A host texture's range of a texture heap; dropping it gives the range
+/// back.
+#[cfg(windows)]
+pub(crate) struct Cut {
+    heap: usize,
+    offset: u64,
+    len: u64,
+}
+
+#[cfg(windows)]
+impl Drop for Cut {
+    fn drop(&mut self) {
+        let mut heaps = TEXTURE_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(heap) = heaps.get_mut(self.heap) {
+            heap.ranges.give(self.offset, self.len);
+            HEAP_FREE.fetch_add(self.len, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// A placed texture whose [`HostTexture`] is gone, and its range. The
+/// texture is released first, then the range given back (field order).
+#[cfg(windows)]
+struct Leaving(windows::Win32::Graphics::Direct3D12::ID3D12Resource, #[allow(dead_code)] Cut);
+// SAFETY: a free-threaded D3D12 object and a range.
+#[cfg(windows)]
+unsafe impl Send for Leaving {}
+
+/// Placed textures on their way out: something still holds the host
+/// resource (a host slot showing its view, a list). Their ranges are not
+/// cut again until nothing does. Run `pool_try1` gave the range back with
+/// the `HostTexture`: the prison room's shirts turned black, a slot still
+/// showing a texture whose memory another one had been placed in.
+#[cfg(windows)]
+static LEAVING: std::sync::Mutex<Vec<Leaving>> = std::sync::Mutex::new(Vec::new());
+/// How many wait there, for the frame line.
+pub(crate) static LEAVING_NOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether the reference `texture` is is the last one to its resource.
+#[cfg(windows)]
+fn last_reference(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> bool {
+    let raw = windows::core::Interface::as_raw(texture);
+    // SAFETY: a live COM object, whose first word points at the table of
+    // `IUnknown`; a reference added and released again, which tells how
+    // many are left.
+    unsafe {
+        let table = *raw.cast::<*const windows::core::IUnknown_Vtbl>();
+        ((*table).AddRef)(raw);
+        ((*table).Release)(raw) == 1
+    }
+}
+
+/// Lets go of the leaving textures nothing else holds any more (at most
+/// ten times a second): the texture and then its range, once the
+/// submissions started by now have run.
+#[cfg(windows)]
+fn sweep_leaving() {
+    use std::sync::atomic::Ordering::Relaxed;
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = crate::host::now_ms();
+    let last = LAST.load(Relaxed);
+    if now < last + 100 || LAST.compare_exchange(last, now, Relaxed, Relaxed).is_err() {
+        return;
+    }
+    let mut gone = Vec::new();
+    {
+        let mut leaving = LEAVING.lock().unwrap_or_else(|e| e.into_inner());
+        let mut i = 0;
+        while i < leaving.len() {
+            if last_reference(&leaving[i].0) {
+                gone.push(leaving.swap_remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        LEAVING_NOW.store(leaving.len() as u64, Relaxed);
+    }
+    for leaving in gone {
+        crate::host::retire(leaving);
+    }
+}
+
+/// A plain texture (no target, no unordered access) placed in a range of
+/// a big heap, with the range. A committed resource per texture is an
+/// allocation in the host's kernel each; the pass over textures picked by
+/// index made 1,000-2,000 a frame in the opening cutscene (run
+/// `dl_diag1`: 0.3-0.5 ms per slot for the texture and its view). `None`
+/// for textures of an eighth of a heap and more, and when the host
+/// refuses: the caller then makes a committed one.
+///
+/// shortcut: a range given back is not cleared, so a texture placed there
+/// later starts with what the last one held where a committed one starts
+/// with zeros. Title textures are uploaded before they are sampled.
+#[cfg(windows)]
+fn placed_texture(
+    host: &crate::host::Host,
+    d: &ResourceDesc,
+    state: windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES,
+) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, Cut)> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    // SAFETY: the description has the host's layout (as in `host_texture`).
+    let desc = unsafe { std::ptr::from_ref(d).cast::<D3D12_RESOURCE_DESC>().read_unaligned() };
+    // SAFETY: plain query of the device.
+    let info = unsafe { host.device.GetResourceAllocationInfo(0, &[desc]) };
+    let (len, align) = (info.SizeInBytes, info.Alignment);
+    if len == 0 || len > TEXTURE_HEAP / 8 || !align.is_power_of_two() {
+        return None;
+    }
+    sweep_leaving();
+    let (heap, cut) = {
+        let mut heaps = TEXTURE_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        // The newest heap first: the older ones are full but for holes.
+        let found = heaps
+            .iter_mut()
+            .enumerate()
+            .rev()
+            .find_map(|(i, h)| h.ranges.take(len, align).map(|offset| (i, offset)));
+        let (index, offset) = match found {
+            Some(found) => found,
+            None => {
+                // Not past the budget the system gives: the caller makes a
+                // committed texture then, if it makes one at all.
+                if let Some([budget, used, ..]) = host.video_memory()
+                    && used + TEXTURE_HEAP >= budget / 20 * 19
+                {
+                    return None;
+                }
+                let heap_desc = D3D12_HEAP_DESC {
+                    SizeInBytes: TEXTURE_HEAP,
+                    Properties: D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    Alignment: 0,
+                    Flags: D3D12_HEAP_FLAG_DENY_BUFFERS | D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES,
+                };
+                let mut heap: Option<ID3D12Heap> = None;
+                // SAFETY: plain creation of a heap; the out pointer is ours.
+                if let Err(e) = unsafe { host.device.CreateHeap(&heap_desc, &mut heap) } {
+                    tracing::warn!(error = %e, heaps = heaps.len(), "no heap for plain textures");
+                    return None;
+                }
+                let heap = heap?;
+                let index = heaps.len();
+                tracing::info!(index, megabytes = TEXTURE_HEAP >> 20, "a heap for plain textures made");
+                let mut ranges = crate::ranges::Ranges::new(TEXTURE_HEAP);
+                let offset = ranges.take(len, align)?;
+                heaps.push(TextureHeap { heap, ranges });
+                HEAP_FREE.fetch_add(TEXTURE_HEAP, std::sync::atomic::Ordering::Relaxed);
+                TEXTURES_MADE[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                (index, offset)
+            }
+        };
+        HEAP_FREE.fetch_sub(len, std::sync::atomic::Ordering::Relaxed);
+        (heaps[index].heap.clone(), Cut { heap: index, offset, len })
+    };
+    let mut texture: Option<ID3D12Resource> = None;
+    // SAFETY: the range is this texture's alone until `cut` is dropped.
+    let made = unsafe { host.device.CreatePlacedResource(&heap, cut.offset, &desc, state, None, &mut texture) };
+    if let Err(e) = made {
+        tracing::warn!(error = %e, desc = ?d, "no placed host texture");
+        return None;
+    }
+    Some((texture?, cut))
+}
+
 /// A host texture like the title's: same description, in GPU memory,
 /// without the console's layout and flags.
 #[cfg(windows)]
@@ -1621,7 +1845,7 @@ fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, Option<Cut>)> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
@@ -1675,6 +1899,25 @@ fn host_texture(
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
     };
+    let first_state = D3D12_RESOURCE_STATES(crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32);
+    let making = std::time::Instant::now();
+    // A texture nothing renders to or writes: in a range of a big heap.
+    if d.flags & (TARGET | DEPTH | UNORDERED) == 0
+        && d.sample_count == 1
+        && clear_value.is_none()
+        && texture_heaps()
+        && let Some((t, cut)) = placed_texture(host, &d, first_state)
+    {
+        TEXTURES_MADE[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        TEXTURES_MADE[3].fetch_add(making.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        crate::host::name(&t, || {
+            format!(
+                "title texture {}x{}x{} f{} mips {} placed",
+                d.width, d.height, d.depth_or_array_size, d.format, d.mip_levels
+            )
+        });
+        return Some((t, Some(cut)));
+    }
     let mut texture: Option<ID3D12Resource> = None;
     // SAFETY: the description has the host layout (checked size, same
     // fields); the out pointer is ours.
@@ -1683,14 +1926,14 @@ fn host_texture(
             &heap,
             D3D12_HEAP_FLAG_NONE,
             (&raw const d).cast(),
-            D3D12_RESOURCE_STATES(
-                crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
-            ),
+            first_state,
             // The same layout: format, then color or depth and stencil.
             clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
             &mut texture,
         )
     };
+    TEXTURES_MADE[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    TEXTURES_MADE[1].fetch_add(making.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, "no host texture");
     }
@@ -1699,7 +1942,7 @@ fn host_texture(
             format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
         });
     }
-    texture
+    texture.map(|t| (t, None))
 }
 
 /// A texture's console memory and description; `None` for buffers.

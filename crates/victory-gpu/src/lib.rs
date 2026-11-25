@@ -44,6 +44,7 @@ pub mod pipeline;
 pub mod prof;
 #[cfg(windows)]
 mod primitive;
+mod ranges;
 pub mod query;
 pub mod queue;
 pub mod resource;
