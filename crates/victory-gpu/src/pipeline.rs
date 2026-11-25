@@ -519,6 +519,8 @@ fn copy(stage: &'static str, code: &Bytecode) -> Option<Arc<Shader>> {
 fn hand_out(
     shaders: Vec<Arc<Shader>>,
     #[cfg(windows)] graphics: Option<Box<host::GraphicsState>>,
+    // The stream's state for the list of created pipelines (`manifest`).
+    #[cfg(windows)] recorded: Option<Vec<u8>>,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
@@ -527,6 +529,8 @@ fn hand_out(
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
     #[cfg(windows)]
     make::early(&host);
+    #[cfg(windows)]
+    manifest::record(host.key(), &shaders, recorded.as_deref());
     #[cfg(windows)]
     let builder = of_builder(&shaders);
     #[cfg(windows)]
@@ -566,6 +570,8 @@ pub(crate) extern "system" fn create_graphics(
         shaders,
         #[cfg(windows)]
         None,
+        #[cfg(windows)]
+        None,
         iid,
         out,
     )
@@ -584,6 +590,8 @@ pub(crate) extern "system" fn create_compute(
     };
     hand_out(
         copy("compute", &desc.stage).into_iter().collect(),
+        #[cfg(windows)]
+        None,
         #[cfg(windows)]
         None,
         iid,
@@ -660,6 +668,8 @@ pub(crate) extern "system" fn create_stream(
     let mut shaders = Vec::new();
     #[cfg(windows)]
     let mut graphics = host::GraphicsState::default();
+    #[cfg(windows)]
+    let mut recorded = manifest::Recorded::default();
     let mut at = 0;
     while at + 8 <= desc.size {
         // SAFETY: inside the stream the title passes.
@@ -680,14 +690,21 @@ pub(crate) extern "system" fn create_stream(
         #[cfg(windows)]
         // SAFETY: a whole subobject of this kind lies at `at`.
         unsafe {
-            graphics.read(kind, desc.stream.add(at))
+            graphics.read(kind, desc.stream.add(at));
+            if at + size <= desc.size {
+                recorded.subobject(kind, std::slice::from_raw_parts(desc.stream.add(at), size));
+            }
         };
         at += size;
     }
+    #[cfg(windows)]
+    let recorded = recorded.finish(&graphics);
     hand_out(
         shaders,
         #[cfg(windows)]
         Some(Box::new(graphics)),
+        #[cfg(windows)]
+        Some(recorded),
         iid,
         out,
     )
@@ -716,6 +733,15 @@ pub(crate) mod host;
 mod library;
 #[cfg(windows)]
 mod make;
+#[cfg(windows)]
+mod manifest;
+#[cfg(windows)]
+mod offline;
+
+#[cfg(windows)]
+pub use manifest::Created;
+#[cfg(windows)]
+pub use offline::{Precompiled, created_pipelines, pipeline_counts, precompile};
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.
@@ -742,6 +768,7 @@ pub fn use_pipeline_cache(dir: std::path::PathBuf) {
 #[cfg(windows)]
 pub fn save_pipeline_cache() {
     library::save(true);
+    manifest::write();
 }
 
 #[cfg(test)]
@@ -861,5 +888,68 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+
+    /// With a pipeline cache, a pipeline the title creates goes into the
+    /// list for `victory precompile`, and what the list holds makes the
+    /// same pipeline again: the same shaders, state and key.
+    #[cfg(windows)]
+    #[test]
+    fn created_pipelines_are_listed_for_precompiling() {
+        // The cache folder is the process's: it stays for the other tests.
+        let dir = tempfile::tempdir().unwrap().keep();
+        use_pipeline_cache(dir.clone());
+        let dir = library::dir().unwrap().clone();
+        let (ms, ps) = ([0x5au8; 11], [0xa5u8; 13]);
+        let mut stream = vec![0u8; 0x60];
+        let mut put = |at: usize, v: u64| stream[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        // A mesh and a pixel shader, a sample mask, a topology and a
+        // depth format: 0x60 bytes.
+        put(0x00, 24);
+        put(0x08, ms.as_ptr() as u64);
+        put(0x10, ms.len() as u64);
+        put(0x18, 2);
+        put(0x20, ps.as_ptr() as u64);
+        put(0x28, ps.len() as u64);
+        put(0x30, 9 | 0x55 << 32);
+        put(0x38, 14 | 3 << 32);
+        put(0x40, 16 | 40 << 32);
+        let desc = StreamDesc {
+            size: 0x48,
+            stream: stream.as_ptr(),
+        };
+        let mut p = std::ptr::null();
+        assert_eq!(create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p), S_OK);
+        let made = &pipeline(p).host;
+        manifest::write();
+        let listed = manifest::created(&dir);
+        let entry = listed.iter().find(|c| c.key == made.key()).expect("the pipeline, listed");
+        let hash = |bytes: &[u8]| <[u8; 8]>::try_from(&blake3::hash(bytes).as_bytes()[..8]).unwrap();
+        assert_eq!(entry.shaders, [("mesh", hash(&ms)), ("pixel", hash(&ps))]);
+        let state = manifest::replay(entry.state.as_ref().expect("a stream's state")).unwrap();
+        assert_eq!(state.describe(), made.graphics.as_ref().unwrap().describe());
+        assert_ne!(state.describe(), host::GraphicsState::default().describe());
+        // Put together again as `precompile` does, it has the run's key.
+        let again = make::Pending::new(
+            vec![shader("mesh", &ms), shader("pixel", &ps)],
+            Some(Box::new(state)),
+        );
+        assert_eq!(again.key(), made.key());
+        // A compute pipeline from the plain description has no state.
+        let cs = [0x3cu8; 9];
+        let desc = ComputeHead {
+            root: std::ptr::null(),
+            stage: Bytecode {
+                code: cs.as_ptr(),
+                size: cs.len(),
+            },
+        };
+        let mut q = std::ptr::null();
+        assert_eq!(create_compute(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut q), S_OK);
+        manifest::write();
+        let listed = manifest::created(&dir);
+        let entry = listed.iter().find(|c| c.key == pipeline(q).host.key()).expect("listed");
+        assert!(entry.computes() && entry.state.is_none());
+        assert_eq!(entry.key, Created::compute(hash(&cs)).key);
     }
 }

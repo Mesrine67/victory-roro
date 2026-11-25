@@ -115,6 +115,21 @@ impl Pending {
         }
     }
 
+    /// What names it across runs.
+    pub(crate) fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Why it is not made, if it is not.
+    pub(crate) fn left_out(&self) -> Option<&'static str> {
+        self.left_out
+    }
+
+    /// Whether one of its shaders was tried and does not translate.
+    pub(crate) fn untranslated(&self) -> bool {
+        self.shaders.iter().any(|s| matches!(s.translated.get(), Some(None)))
+    }
+
     fn make(&self) {
         let _ = self.begun.set(Instant::now());
         self.made

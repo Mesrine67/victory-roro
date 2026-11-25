@@ -5,6 +5,7 @@
 
 mod census;
 mod inspect;
+mod precompile;
 mod run;
 mod shader;
 mod translate;
@@ -96,6 +97,40 @@ enum Command {
         #[arg(long)]
         no_pipelines: bool,
     },
+    /// Make the host pipelines of every pipeline the title created in
+    /// earlier runs (a run lists them in the cache), for the host GPU in
+    /// use, so that no run compiles them when it first draws with them.
+    /// Run it with the switches the title runs with. Safe to interrupt:
+    /// the next call goes on from the last save.
+    Precompile {
+        /// Where the title's shaders are looked for (default: the
+        /// configured game directory).
+        paths: Vec<PathBuf>,
+        /// Report what would be made, and stop.
+        #[arg(long)]
+        plan: bool,
+        /// Only the pipelines an earlier run has drawn with.
+        #[arg(long)]
+        used: bool,
+        /// At most this many pipelines (drawn ones first, then compute).
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Worker threads (default: all logical cores but two).
+        #[arg(long)]
+        jobs: Option<usize>,
+        /// Seconds between saves of the pipeline library.
+        #[arg(long, default_value_t = 300)]
+        save_every: u64,
+        /// Diagnostics: write the hash and size of every shader container
+        /// in the title's files to this file, and stop.
+        #[arg(long)]
+        list_shaders: Option<PathBuf>,
+        /// Diagnostics: make a compute pipeline of each shader hash in
+        /// this file (16 hex digits, as a run's log prints them) instead
+        /// of the pipelines the runs listed.
+        #[arg(long)]
+        compute_shaders: Option<PathBuf>,
+    },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -175,6 +210,25 @@ fn main() -> Result<()> {
             translate::run(paths, validate, pipelines, list, jobs)
         }
         Command::Warm { paths, jobs, no_pipelines } => translate::warm(paths, jobs, !no_pipelines),
+        Command::Precompile {
+            paths,
+            plan,
+            used,
+            limit,
+            jobs,
+            save_every,
+            list_shaders,
+            compute_shaders,
+        } => precompile::run(precompile::Options {
+            paths,
+            plan,
+            used,
+            limit,
+            jobs,
+            save_every,
+            list_shaders,
+            compute_shaders,
+        }),
         Command::Run {
             exe,
             unimplemented,

@@ -62,6 +62,17 @@ pub fn use_pipeline_cache(dir: PathBuf) {
     let _ = DIR.set(dir);
 }
 
+/// The folder the pipeline cache is kept in, if one was given.
+pub(crate) fn dir() -> Option<&'static PathBuf> {
+    DIR.get()
+}
+
+/// The library's size as it would be written now, in bytes (0 without one).
+pub(crate) fn size() -> u64 {
+    // SAFETY: a plain query.
+    library().map_or(0, |l| unsafe { l.library.GetSerializedSize() } as u64)
+}
+
 /// Host pipelines created, loaded from the library, and title pipelines
 /// started at creation, since the start.
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);

@@ -665,6 +665,20 @@ fn named_adapter() -> Option<IDXGIAdapter1> {
     }
 }
 
+/// The name of the adapter the host device is on, and its dedicated memory
+/// in MiB; `None` without a host GPU. Makes the device on first use, as
+/// every use of the host does.
+pub fn adapter() -> Option<(String, u64)> {
+    let adapter = host()?.adapter.as_ref()?;
+    // SAFETY: a plain DXGI adapter query.
+    let desc = unsafe { adapter.GetDesc1() }.ok()?;
+    let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+    Some((
+        String::from_utf16_lossy(&desc.Description[..len]),
+        desc.DedicatedVideoMemory as u64 / (1 << 20),
+    ))
+}
+
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
 /// Reject it before creating a device in diagnostics' software-only mode.
 fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {

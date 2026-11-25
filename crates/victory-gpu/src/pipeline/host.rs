@@ -29,6 +29,9 @@ pub(crate) struct GraphicsState {
     /// Input elements, their names pointing into `names`.
     inputs: Vec<D3D12_INPUT_ELEMENT_DESC>,
     names: Vec<CString>,
+    /// Each input element's format as the title gave it (`inputs` holds
+    /// the host's).
+    title_formats: Vec<DXGI_FORMAT>,
     strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE,
     pub(crate) topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE,
     pub(crate) targets: D3D12_RT_FORMAT_ARRAY,
@@ -80,6 +83,7 @@ impl Default for GraphicsState {
             bounds: false,
             inputs: Vec::new(),
             names: Vec::new(),
+            title_formats: Vec::new(),
             strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED,
             topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED,
             targets: D3D12_RT_FORMAT_ARRAY::default(),
@@ -130,21 +134,12 @@ impl GraphicsState {
                         layout.pInputElementDescs,
                         layout.NumElements as usize,
                     );
-                    self.names = elements
-                        .iter()
-                        .map(|e| CStr::from_ptr(e.SemanticName.0.cast()).to_owned())
-                        .collect();
-                    self.inputs = elements
-                        .iter()
-                        .zip(&self.names)
-                        .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC {
-                            SemanticName: PCSTR(name.as_ptr().cast()),
-                            Format: DXGI_FORMAT(
-                                crate::resource::pc_format(e.Format.0 as u32) as i32
-                            ),
-                            ..*e
-                        })
-                        .collect();
+                    self.set_inputs(
+                        elements
+                            .iter()
+                            .map(|e| (CStr::from_ptr(e.SemanticName.0.cast()).to_owned(), *e))
+                            .collect(),
+                    );
                 }
                 13 => {
                     self.strip_cut =
@@ -170,6 +165,35 @@ impl GraphicsState {
                 _ => {}
             }
         }
+    }
+
+    /// Takes in an input layout: each element's name, and the element as
+    /// the title gives it (its own name pointer is not read).
+    pub(super) fn set_inputs(&mut self, elements: Vec<(CString, D3D12_INPUT_ELEMENT_DESC)>) {
+        self.title_formats = elements.iter().map(|(_, e)| e.Format).collect();
+        self.names = elements.iter().map(|(name, _)| name.clone()).collect();
+        self.inputs = elements
+            .iter()
+            .zip(&self.names)
+            .map(|((_, e), name)| D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR(name.as_ptr().cast()),
+                Format: DXGI_FORMAT(crate::resource::pc_format(e.Format.0 as u32) as i32),
+                ..*e
+            })
+            .collect();
+    }
+
+    /// The input layout as [`GraphicsState::set_inputs`] took it in: for
+    /// the list of created pipelines (`manifest`).
+    pub(super) fn title_inputs(&self) -> impl Iterator<Item = (&CStr, D3D12_INPUT_ELEMENT_DESC)> {
+        self.inputs
+            .iter()
+            .zip(&self.names)
+            .zip(&self.title_formats)
+            .map(|((e, name), format)| {
+                let e = D3D12_INPUT_ELEMENT_DESC { Format: *format, ..*e };
+                (name.as_c_str(), e)
+            })
     }
 
     /// Everything the state holds, as text: part of a pipeline's name in
