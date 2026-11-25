@@ -2523,6 +2523,8 @@ static RESOURCE_FUNCTIONS: Table<32> = {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    use crate::host::Barred as _;
     use crate::object::slot;
 
     type Release = extern "system" fn(This) -> u32;
