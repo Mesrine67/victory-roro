@@ -55,6 +55,7 @@ Cross-references like "section 5.4" refer to the numbered headings in these file
 | [33-shared-core-findings.md](docs/33-shared-core-findings.md) | Lessons from several titles on one shared core: DMA/move engines, zlib on DMA, readbacks, descriptors, slabs, measurement pitfalls. |
 | [35-exact-path-design-spec.md](docs/35-exact-path-design-spec.md) | The exact texture path written as a specification: definitions, 49 numbered rules, token state machine, breach classes, cost model, two root-cause case studies, and how to test it. |
 | [36-switch-survey-and-threading.md](docs/36-switch-survey-and-threading.md) | What every runtime knob taught us, by subsystem, plus the texture threading study (what was rejected and why). |
+| [38-pipelines-shader-caches-load-times.md](docs/38-pipelines-shader-caches-load-times.md) | Pipeline (PSO) creation in a translator: cache layers, pre-building without recording play, what failed, load-time and hitch numbers. |
 
 ## Tools
 [tools/](tools/): a Linux-side `/proc` sampler for Wine processes, a headless RGP capture reader and comparer, an event-triggered RGP capture watcher, and a slow-frame classifier. See [tools/README.md](tools/README.md).
