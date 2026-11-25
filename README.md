@@ -44,6 +44,7 @@ Cross-references like "section 5.4" refer to the numbered headings in these file
 | [23-descriptor-volatility-sources.md](docs/23-descriptor-volatility-sources.md) | What the public D3D12 docs say about descriptor volatility, with links, and what it means for a translator. |
 | [24-wine-proton-facts.md](docs/24-wine-proton-facts.md) | Wine/Proton/vkd3d-proton behaviours that changed our design. |
 | [25-open-questions.md](docs/25-open-questions.md) | What we still don't know. |
+| [34-public-references.md](docs/34-public-references.md) | 138 public sources (D3D12 spec, vkd3d-proton, Vulkan, NVIDIA/AMD tools, Wine/Proton, streaming, pipelines, pacing, memory), each link checked, with a note on why it mattered. |
 
 ## Deep dives (history, in detail)
 | Document | What it is |
