@@ -249,6 +249,25 @@ pub extern "C" fn terminate() -> ! {
     host::abort()
 }
 
+/// The CRT keeps one callback a process for the thread-local destructors of
+/// its exe, and ends the process (`terminate`) when a second one is
+/// registered. The title registers its own at start, through the host CRT
+/// its imports bind to. That is the only one while our exe has no C++ in it;
+/// the Tracy client is C++ with thread-locals, so with the `tracy` feature
+/// our own start-up has taken the slot and the title died 35 ms in
+/// (0xC0000409 in `ucrtbase!abort`). In that build the title's callback is
+/// kept here instead: it would only run its thread-local destructors as the
+/// process exits.
+#[cfg(feature = "tracy")]
+pub extern "C" fn _register_thread_local_exe_atexit_callback(callback: usize) {
+    static TITLES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    TITLES.store(callback, std::sync::atomic::Ordering::Relaxed);
+    tracing::info!(
+        callback = format_args!("{callback:#x}"),
+        "the title's thread-local exit callback is kept from the host CRT (Tracy build: ours holds the one slot)"
+    );
+}
+
 /// See [`terminate`].
 pub extern "C" fn _invalid_parameter_noinfo_noreturn() -> ! {
     tracing::error!(from = %host::callers(), "title passed an invalid parameter");
@@ -382,6 +401,8 @@ pub(crate) fn module() -> HleModule {
             hle_export!(_invalid_parameter_noinfo_noreturn),
             hle_export!(TerminateProcess),
             hle_export!(SetUnhandledExceptionFilter),
+            #[cfg(feature = "tracy")]
+            hle_export!(_register_thread_local_exe_atexit_callback),
         ],
     }
 }

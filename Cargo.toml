@@ -49,16 +49,13 @@ opus-pure = "0.2.4"
 # sit in front of our own write-detection exception handler and end the
 # process at the first guarded write. `ondemand`: nothing is collected until
 # a profiler connects. `only-localhost`, no `broadcast`: not on the network.
+# Sampling and system tracing are left out: they need an elevated process,
+# and these runs are not. Add "sampling", "system-tracing",
+# "context-switch-tracing" and "wait-stacks" for a run as administrator.
 tracy-client = { version = "0.19.0", default-features = false, features = [
     "enable",
     "ondemand",
     "only-localhost",
-    "system-tracing",
-    "context-switch-tracing",
-    "sampling",
-    "code-transfer",
-    "callstack-inlines",
-    "wait-stacks",
 ] }
 tracy-client-sys = { version = "=0.30.1", default-features = false }
 tracing-tracy = { version = "0.12.0", default-features = false }
