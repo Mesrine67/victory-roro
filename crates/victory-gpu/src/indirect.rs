@@ -90,6 +90,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
         cost = g.x * g.y * g.z * 64u;
         groups = g;
+        // Diagnostics: dispatch records seen, and those that run anything.
+        uint noted;
+        budget.InterlockedAdd(20, 1u, noted);
+        budget.InterlockedAdd(24, cost != 0u ? 1u : 0u, noted);
     } else {
         // Mesh dispatches: the console's are one-dimensional.
         uint3 g = src_args.Load3(src_at);
@@ -104,6 +108,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         uint was;
         budget.InterlockedMax(4, g.x, was);
         budget.InterlockedAdd(8, min(g.x, 1u << 24), was);
+        // And the mesh records seen, and those that ask for any group.
+        budget.InterlockedAdd(12, 1u, was);
+        budget.InterlockedAdd(16, g.x != 0u ? 1u : 0u, was);
         g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
         cost = g.x * g.y * g.z * 128u;
         groups = g;

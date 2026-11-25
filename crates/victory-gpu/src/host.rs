@@ -1270,7 +1270,7 @@ pub(crate) fn dred_on() -> bool {
 /// Indirect mesh dispatches since the last frame line: the largest group
 /// count a record asked for, and the groups asked in all (from the lists'
 /// budget buffers, a run late).
-static MESH_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+static MESH_GROUPS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 /// Whether each list of a submission runs and is timed on its own, slow
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
@@ -5058,7 +5058,12 @@ impl HostList {
                 let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
                 MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
                 MESH_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
-                for k in 0..3 {
+                // Then: mesh records seen and those asking for any group,
+                // dispatch records seen and those running anything.
+                for k in 3..7 {
+                    MESH_GROUPS[k - 1].fetch_add(u64::from(words.add(k).read_volatile()), Ordering::Relaxed);
+                }
+                for k in 0..7 {
                     words.add(k).write_volatile(0);
                 }
             })));
@@ -5733,8 +5738,10 @@ impl Meter {
         let indirect = crate::list::take_indirect() as f64 / frames;
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
+        let [mesh_records, mesh_some, dispatch_records, dispatch_some] =
+            [2, 3, 4, 5].map(|i| MESH_GROUPS[i].swap(0, Ordering::Relaxed) as f64 / frames);
         tracing::info!(
-            "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
+            "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame;              of {mesh_records:.0} mesh records a frame on the card {mesh_some:.0} ask for any group, of {dispatch_records:.0} dispatch records {dispatch_some:.0} run anything"
         );
         late_line(frames);
         card_clock_line(frames, ms);
