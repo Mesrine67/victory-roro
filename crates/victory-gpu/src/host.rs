@@ -1069,6 +1069,187 @@ impl PlanePass {
     }
 }
 
+/// The pass that stands in for the title's upscaler (`crate::upscale`): the
+/// part of the colour input the title rendered, drawn over the output with
+/// linear filtering.
+const UPSCALE: &str = r#"
+#define RS "DescriptorTable(SRV(t0), visibility = SHADER_VISIBILITY_PIXEL), RootConstants(num32BitConstants = 4, b0, visibility = SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter = FILTER_MIN_MAG_LINEAR_MIP_POINT, addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, addressW = TEXTURE_ADDRESS_CLAMP, visibility = SHADER_VISIBILITY_PIXEL)"
+Texture2D<float4> colour : register(t0);
+SamplerState smooth : register(s0);
+cbuffer sizes : register(b0) { float2 scale; float2 limit; };
+[RootSignature(RS)]
+float4 upscale(float4 p : SV_Position) : SV_Target {
+    return float4(colour.SampleLevel(smooth, min(p.xy * scale, limit), 0).rgb, 1.0);
+}
+"#;
+
+/// The upscale pass's root signature and pipeline per output format.
+struct UpscalePipelines(Vec<(i32, Option<PlanePipeline>)>);
+
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for UpscalePipelines {}
+
+fn upscale_pipeline(format: DXGI_FORMAT) -> Option<PlanePipeline> {
+    use windows::core::s;
+    static MADE: Mutex<UpscalePipelines> = Mutex::new(UpscalePipelines(Vec::new()));
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, pipeline)) = made.0.iter().find(|m| m.0 == format.0) {
+        return pipeline.clone();
+    }
+    let make = || -> windows::core::Result<PlanePipeline> {
+        let device = &host().ok_or_else(windows::core::Error::empty)?.device;
+        let vs = compile(PLANE_CORNERS, s!("corner"), s!("vs_5_1"))?;
+        let ps = compile(UPSCALE, s!("upscale"), s!("ps_5_1"))?;
+        let code = |bytes: &[u8]| D3D12_SHADER_BYTECODE {
+            pShaderBytecode: bytes.as_ptr().cast(),
+            BytecodeLength: bytes.len(),
+        };
+        let mut blend = D3D12_BLEND_DESC::default();
+        blend.RenderTarget[0].RenderTargetWriteMask = 15;
+        let mut formats = [DXGI_FORMAT(0); 8];
+        formats[0] = format;
+        // SAFETY: the root signature is inside the pixel shader; the
+        // description points at live data and never releases its pointer.
+        unsafe {
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, &ps[..])?;
+            let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                VS: code(&vs[..]),
+                PS: code(&ps[..]),
+                BlendState: blend,
+                SampleMask: u32::MAX,
+                RasterizerState: D3D12_RASTERIZER_DESC {
+                    FillMode: D3D12_FILL_MODE_SOLID,
+                    CullMode: D3D12_CULL_MODE_NONE,
+                    DepthClipEnable: true.into(),
+                    ..Default::default()
+                },
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: 1,
+                RTVFormats: formats,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            };
+            let pipeline: ID3D12PipelineState = device.CreateGraphicsPipelineState(&desc)?;
+            Ok((root, pipeline))
+        }
+    };
+    let pipeline = match make() {
+        Ok(pipeline) => Some(pipeline),
+        Err(e) => {
+            tracing::warn!(error = %e, format = format.0, "no pipeline to upscale with: the title's upscaler is left to it");
+            None
+        }
+    };
+    made.0.push((format.0, pipeline.clone()));
+    pipeline
+}
+
+/// Records into `list` the pass that draws the first `render` texels of
+/// `colour` (readable by pixel shaders) over the first `size` texels of
+/// `output` (in the render target state). As [`record_plane_pass`] it puts
+/// nothing back of what it sets: the caller has the title's state set
+/// again (`crate::draw::State::replay`). False if it recorded nothing.
+pub(crate) fn record_upscale(
+    list: &HostList,
+    colour: &ID3D12Resource,
+    output: &ID3D12Resource,
+    render: [u32; 2],
+    size: [u32; 2],
+) -> bool {
+    let (Some(host), Some(pass)) = (host(), plane_pass()) else {
+        return false;
+    };
+    // SAFETY: live resources.
+    let (from, to) = unsafe { (colour.GetDesc(), output.GetDesc()) };
+    // (typeless families the title's targets come in, as their plain format)
+    let typed = |f: DXGI_FORMAT| DXGI_FORMAT(match f.0 {
+        9 => 10,
+        23 => 24,
+        27 => 28,
+        f => f,
+    });
+    if to.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 == 0 {
+        tracing::warn!(format = to.Format.0, flags = to.Flags.0, "the upscaler's output is no render target here");
+        return false;
+    }
+    let Some((root, pipeline)) = upscale_pipeline(typed(to.Format)) else {
+        return false;
+    };
+    let slot = pass.next.fetch_add(1, Ordering::Relaxed) % PLANE_VIEWS;
+    let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: typed(from.Format),
+        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Texture2D: D3D12_TEX2D_SRV {
+                MostDetailedMip: 0,
+                MipLevels: 1,
+                ..Default::default()
+            },
+        },
+    };
+    let target = D3D12_RENDER_TARGET_VIEW_DESC {
+        Format: typed(to.Format),
+        ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+        Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+            Texture2D: D3D12_TEX2D_RTV { MipSlice: 0, PlaneSlice: 0 },
+        },
+    };
+    let target = host.rtv(Some(output), Some(&target));
+    let (width, height) = (size[0].min(to.Width as u32), size[1].min(to.Height));
+    let (w, h) = (from.Width as f32, from.Height as f32);
+    let sizes: [f32; 4] = [
+        render[0] as f32 / (width as f32 * w),
+        render[1] as f32 / (height as f32 * h),
+        (render[0] as f32 - 0.5) / w,
+        (render[1] as f32 - 0.5) / h,
+    ];
+    let cpu = D3D12_CPU_DESCRIPTOR_HANDLE {
+        ptr: pass.cpu + (slot * pass.step) as usize,
+    };
+    let gpu = D3D12_GPU_DESCRIPTOR_HANDLE {
+        ptr: pass.gpu + u64::from(slot * pass.step),
+    };
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| {
+        tracing::info!(
+            from = format_args!("{}x{} of {}x{} f{}", render[0], render[1], from.Width, from.Height, from.Format.0),
+            to = format_args!("{width}x{height} of {}x{} f{}", to.Width, to.Height, to.Format.0),
+            "the title's upscaler stood in for: its colour input drawn over its output"
+        );
+    });
+    let list = &list.list;
+    // SAFETY: an open list; a slot of our heap; live resources and objects
+    // (the pass's own live as long as the process); four constants.
+    unsafe {
+        host.device.CreateShaderResourceView(colour, Some(&view), cpu);
+        list.SetDescriptorHeaps(&[Some(pass.views.clone())]);
+        list.SetGraphicsRootSignature(&root);
+        list.SetPipelineState(&pipeline);
+        list.SetGraphicsRootDescriptorTable(0, gpu);
+        list.SetGraphicsRoot32BitConstants(1, 4, sizes.as_ptr().cast(), 0);
+        list.OMSetRenderTargets(1, Some(&target), false, None);
+        list.RSSetViewports(&[D3D12_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: width as f32,
+            Height: height as f32,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        }]);
+        list.RSSetScissorRects(&[RECT {
+            left: 0,
+            top: 0,
+            right: width as i32,
+            bottom: height as i32,
+        }]);
+        list.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY(4));
+        list.DrawInstanced(3, 1, 0, 0);
+    }
+    true
+}
+
 /// Records into `list` the pass that draws `plane`, the twin of the depth
 /// plane of `depth`, into that plane: `depth` in the depth-write state,
 /// `plane` readable by pixel shaders. The pass sets the list's descriptor

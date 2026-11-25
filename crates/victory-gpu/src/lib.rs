@@ -64,7 +64,12 @@ mod texture;
 mod watch;
 
 #[cfg(windows)]
+mod upscale;
+
+#[cfg(windows)]
 pub use host::{adapter as host_adapter, on_failure};
+#[cfg(windows)]
+pub use upscale::hook as upscaler_dispatch;
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
