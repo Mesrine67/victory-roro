@@ -390,6 +390,10 @@ fn with_title<R>(memory: *const u8, size: usize, f: impl FnOnce(&[u8]) -> R) -> 
 /// bytes.
 static STAGED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Since the last frame line: staging buffers made, and the microseconds
+/// the host took to make them (an upload buffer of its own for each).
+pub(crate) static STAGING_MADE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 impl Drop for Staging {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
@@ -1136,7 +1140,10 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
             Some(&mut total),
         );
     }
+    let making = std::time::Instant::now();
     let (buffer, data) = host.upload_buffer(total)?;
+    STAGING_MADE[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    STAGING_MADE[1].fetch_add(making.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
     crate::host::name(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",

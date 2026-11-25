@@ -1945,6 +1945,80 @@ fn landable(line: &[Option<u64>], completed: u64) -> usize {
     line.iter().position(|f| f.is_some_and(|f| f > completed)).unwrap_or(line.len())
 }
 
+/// Diagnostics, with [`relay`]: how well the flags of a piece's last
+/// compares tell its next one. A landing fetches the flagged pieces with a
+/// list of its own, sent behind everything in the air: the thread that
+/// lands waits 93-139 ms a frame for those fetches where the card spends
+/// 10 ms on them (runs fb_stamps1, fb_lists512). A flight could bring the
+/// pieces down itself, behind its compare, if it knew which.
+///
+/// Per frame line, for histories of the last 1, 2, 4 and 8 compares of a
+/// piece (flagged in any of them: taken as flagged next): pieces flagged
+/// and foretold, flagged and not foretold, foretold and not flagged; then
+/// the same for a history of 4 kept per declared range of the piece; then
+/// plans with a flagged piece, and of them those with one not foretold
+/// (by 1, 2, 4, 8 and by range).
+#[cfg(feature = "diagnostics")]
+static FORETOLD: [std::sync::atomic::AtomicU64; 22] = [const { std::sync::atomic::AtomicU64::new(0) }; 22];
+
+/// One plan's pieces for [`FORETOLD`]: `pieces` as (copy, piece, flagged
+/// under any range), `ranged` as (copy, piece, the range's start and end,
+/// fetched).
+#[cfg(feature = "diagnostics")]
+fn foretell(pieces: &[(usize, u32, bool)], ranged: &[(usize, u32, usize, usize, bool)]) {
+    type Histories<K> = Mutex<Option<std::collections::HashMap<K, u8>>>;
+    static BY_PIECE: Histories<(usize, u32)> = Mutex::new(None);
+    static BY_RANGE: Histories<(usize, u32, usize, usize)> = Mutex::new(None);
+    const DEPTHS: [u8; 4] = [0x1, 0x3, 0xf, 0xff];
+    let mut missed = [false; 5];
+    let mut any = false;
+    {
+        let mut map = BY_PIECE.lock().unwrap_or_else(|e| e.into_inner());
+        let map = map.get_or_insert_with(Default::default);
+        for &(copy, piece, flagged) in pieces {
+            let history = map.entry((copy, piece)).or_insert(0);
+            for (k, mask) in DEPTHS.iter().enumerate() {
+                let foretold = *history & mask != 0;
+                let place = match (flagged, foretold) {
+                    (true, true) => 0,
+                    (true, false) => 1,
+                    (false, true) => 2,
+                    (false, false) => continue,
+                };
+                FORETOLD[k * 3 + place].fetch_add(1, Ordering::Relaxed);
+                missed[k] |= place == 1;
+            }
+            any |= flagged;
+            *history = *history << 1 | u8::from(flagged);
+        }
+    }
+    {
+        let mut map = BY_RANGE.lock().unwrap_or_else(|e| e.into_inner());
+        let map = map.get_or_insert_with(Default::default);
+        for &(copy, piece, from, to, flagged) in ranged {
+            let history = map.entry((copy, piece, from, to)).or_insert(0);
+            let foretold = *history & 0xf != 0;
+            let place = match (flagged, foretold) {
+                (true, true) => Some(0),
+                (true, false) => Some(1),
+                (false, true) => Some(2),
+                (false, false) => None,
+            };
+            if let Some(place) = place {
+                FORETOLD[12 + place].fetch_add(1, Ordering::Relaxed);
+                missed[4] |= place == 1;
+            }
+            *history = *history << 1 | u8::from(flagged);
+        }
+    }
+    if any {
+        FORETOLD[15].fetch_add(1, Ordering::Relaxed);
+        for (k, missed) in missed.iter().enumerate() {
+            FORETOLD[16 + k].fetch_add(u64::from(*missed), Ordering::Relaxed);
+        }
+    }
+}
+
 /// For one plan of copies in the card's memory, with [`relay`]: `flags`
 /// holds, for every piece of every range of the plan, the copy, the
 /// piece's number in the copy and whether the compare flagged it there (or
@@ -2198,6 +2272,31 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
     blocked_by(&written, runs, true)
 }
 
+/// Diagnostics: names a read of title memory that waits for flights (the
+/// first 16, then every 128th): what is read, the title buffer it lies in,
+/// and the range flights' shaders may write that it touches. The settles
+/// "for title memory read" are one a frame in the room and the last wait
+/// left when the cap on lists in the air is raised (run fb_lists512: 70-80
+/// ms a frame), and nothing said which read it is.
+#[cfg(feature = "diagnostics")]
+fn read_under_flights(what: &str, from: usize, len: usize, written: &[(usize, usize)]) {
+    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEEN.fetch_add(1, Ordering::Relaxed);
+    if n >= 16 && !n.is_multiple_of(128) {
+        return;
+    }
+    let at = written.partition_point(|r| r.1 <= from);
+    let (lo, hi) = written.get(at).copied().unwrap_or((0, 0));
+    let buffer = crate::shadow::extent(from as u64);
+    let writes = crate::shadow::extent(lo as u64);
+    tracing::info!(
+        "a read of title memory waits for flights ({what}, number {n}): it reads {from:#x}+{len:#x} in title buffer {buffer:x?}; \
+         flights' shaders may write {lo:#x}..{hi:#x} ({} bytes, in title buffer {writes:x?}; {} such ranges in the air)",
+        hi - lo,
+        written.len()
+    );
+}
+
 /// [`late_blocked`] against `written`, the title memory flights' shaders
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
@@ -2212,6 +2311,12 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, src, src + len) || touches(written, dst, dst + len) {
                         if count {
                             LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
+                            #[cfg(feature = "diagnostics")]
+                            if touches(written, src, src + len) {
+                                read_under_flights("a buffer copy's source", src, len, written);
+                            } else {
+                                read_under_flights("a buffer copy's destination", dst, len, written);
+                            }
                         }
                         return Some(WHY_READ);
                     }
@@ -2220,6 +2325,8 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, src, src + len) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
+                            #[cfg(feature = "diagnostics")]
+                            read_under_flights("a fill of upload memory", src, len, written);
                         }
                         return Some(WHY_READ);
                     }
@@ -2229,6 +2336,8 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, at, at + len) {
                         if count {
                             LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
+                            #[cfg(feature = "diagnostics")]
+                            read_under_flights("a texture's memory", at, len, written);
                         }
                         return Some(WHY_READ);
                     }
@@ -3458,6 +3567,24 @@ impl Host {
                     })
                     .collect();
                 let fetched = flagged_pieces(&flags);
+                #[cfg(feature = "diagnostics")]
+                {
+                    let mut pieces: Vec<(usize, u32, bool)> = flags.iter().map(|f| (f.0, f.1, fetched.contains(&(f.0, f.1)))).collect();
+                    pieces.sort_unstable();
+                    pieces.dedup();
+                    let ranged: Vec<(usize, u32, usize, usize, bool)> = plan
+                        .ranges
+                        .iter()
+                        .flat_map(|r| {
+                            let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
+                            let fetched = &fetched;
+                            (0..r.span.pieces).map(move |p| {
+                                (copy, r.span.first + p, r.declared.0, r.declared.1, fetched.contains(&(copy, r.span.first + p)))
+                            })
+                        })
+                        .collect();
+                    foretell(&pieces, &ranged);
+                }
                 for r in &plan.ranges {
                     let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
                     for p in 0..r.span.pieces {
@@ -6043,6 +6170,39 @@ impl Meter {
                 if rehash_runs() { "on" } else { "off" }
             );
         }
+        #[cfg(feature = "diagnostics")]
+        {
+            let f: [f64; 22] = std::array::from_fn(|i| FORETOLD[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if f[15] > 0.0 {
+                tracing::info!(
+                    "flagged pieces foretold by their last compares, per frame (flagged and foretold / flagged and not / foretold and not flagged): \
+                     by the last 1: {:.0}/{:.0}/{:.0}; last 2: {:.0}/{:.0}/{:.0}; last 4: {:.0}/{:.0}/{:.0}; last 8: {:.0}/{:.0}/{:.0}; last 4 of the \
+                     same declared range: {:.0}/{:.0}/{:.0}; of {:.1} plans with a flagged piece, those with one not foretold: {:.1}, {:.1}, {:.1}, \
+                     {:.1}, by range {:.1}",
+                    f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15], f[16], f[17], f[18],
+                    f[19], f[20]
+                );
+            }
+        }
+        {
+            let p: [f64; 7] = std::array::from_fn(|i| crate::draw::HEAP_TEXTURE_PHASES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            let s = [0, 1].map(|i| crate::texture::STAGING_MADE[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if p[5] >= 1000.0 {
+                tracing::info!(
+                    "textures picked by index, the pass per frame: {:.1} ms over {:.0} slots: {:.1} ms asking what is mapped, {:.1} ms making \
+                     host textures and views, {:.1} ms recording uploads (all threads' staging buffers made in the frame: {:.0} in {:.1} ms); \
+                     before it {:.1} ms finding the due slots",
+                    p[5] / 1e3,
+                    p[6],
+                    p[1] / 1e3,
+                    p[2] / 1e3,
+                    p[3] / 1e3,
+                    s[0],
+                    s[1] / 1e3,
+                    p[0] / 1e3
+                );
+            }
+        }
         if crate::cardstamps::on() {
             use crate::cardstamps::{COMPARE, FETCH, REHASH, SENT_UP, TITLE};
             let (sums, lists) = crate::cardstamps::take(std::time::Duration::from_secs(2));
@@ -6065,6 +6225,17 @@ impl Meter {
                 ms(TITLE),
                 n(TITLE)
             );
+        }
+        {
+            let r = [0, 1, 2].map(|i| crate::watch::REMAPPINGS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if r[0] >= 1.0 {
+                tracing::info!(
+                    "the runtime changed what title memory shows {:.0} times a frame: {:.1} ms holding it still, {:.1} ms waiting for reads                      in place to end",
+                    r[0],
+                    r[2] / 1e3,
+                    r[1] / 1e3
+                );
+            }
         }
         let [own, asking, still, texture_refresh_ms] =
             [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);

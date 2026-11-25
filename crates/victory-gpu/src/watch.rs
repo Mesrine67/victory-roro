@@ -630,15 +630,34 @@ pub fn writing(at: usize, len: usize) {
 static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 /// What the runtime holds while it changes what title memory shows
-/// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+/// ([`title_memory_remapping`]), and since when.
+pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>, std::time::Instant);
+
+/// Since the last frame line: changes of what title memory shows by the
+/// runtime, the microseconds they waited for reads in place to end, and
+/// the microseconds they held title memory still. Texture refreshes wait
+/// up to 1.4 s a frame for title memory to hold still in the opening
+/// cutscene (run fb_stamps1); these say how long it is held, and how often.
+pub(crate) static REMAPPINGS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+impl Drop for Remapping {
+    fn drop(&mut self) {
+        REMAPPINGS[2].fetch_add(self.1.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 /// The runtime is about to map, unmap or move physical pages of title
 /// memory: until what it returns is dropped, no read of title memory in
 /// place is under way and none begins ([`title_memory_reading`]). Taken
 /// around the whole change, the unmapping and the mapping again.
 pub fn title_memory_remapping() -> Remapping {
-    Remapping(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
+    use std::sync::atomic::Ordering::Relaxed;
+    let asked = std::time::Instant::now();
+    let held = MAPPING.write().unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
+    REMAPPINGS[0].fetch_add(1, Relaxed);
+    REMAPPINGS[1].fetch_add((now - asked).as_micros() as u64, Relaxed);
+    Remapping(held, now)
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
