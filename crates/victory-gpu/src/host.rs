@@ -797,6 +797,8 @@ pub(crate) struct HostList {
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// Mesh arguments being clamped together in this recording.
+    mesh_batch: Mutex<Option<crate::indirect::MeshBatch>>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -2905,6 +2907,7 @@ impl Host {
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
+                mesh_batch: Mutex::default(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -4492,6 +4495,7 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        self.end_mesh_batch();
         self.twins_to_depth();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
@@ -5140,6 +5144,39 @@ impl HostList {
             self.keep(&old_buf);
         }
         Some(buffer)
+    }
+
+    /// Adds one argument to the current group, opening a clamp if needed.
+    /// The boolean tells the caller whether the clamp changed the bound PSO.
+    pub(crate) fn clamp_mesh_argument(
+        &self,
+        copy: u64,
+        src: &ID3D12Resource,
+        offset: u32,
+    ) -> Option<(ID3D12Resource, u64, bool)> {
+        let mut slot = self.mesh_batch.lock().unwrap_or_else(|e| e.into_inner());
+        let opened = !slot.as_ref().is_some_and(|batch| batch.accepts(copy));
+        if opened {
+            if let Some(batch) = slot.take() {
+                batch.finish(self);
+            }
+            *slot = crate::indirect::MeshBatch::new(self, copy, src);
+        }
+        let (args, at) = slot.as_mut()?.append(offset);
+        Some((args, at, opened))
+    }
+
+    /// A command that may change argument memory, or reuse the scratch
+    /// buffer, must come after the last draw that uses this batch.
+    pub(crate) fn end_mesh_batch(&self) {
+        if let Some(batch) = self
+            .mesh_batch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            batch.finish(self);
+        }
     }
 
     /// Keeps `object` alive until the list is reset.

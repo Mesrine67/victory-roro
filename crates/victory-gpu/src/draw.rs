@@ -146,6 +146,12 @@ fn windows() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
 }
 
+/// Keep the previous mesh window available for an otherwise identical run.
+fn grouped_mesh_clamp() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GROUPED_MESH_CLAMP").is_none_or(|v| v != "0"))
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -522,6 +528,7 @@ impl State {
 
     /// Render targets and depth, set on the host list at once.
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
+        list.end_mesh_batch();
         let Some(host) = crate::host::host() else {
             return;
         };
@@ -1718,6 +1725,7 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        list.end_mesh_batch();
         // It may write the arguments a window holds clamped.
         self.window = None;
         #[cfg(feature = "diagnostics")]
@@ -1868,6 +1876,7 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+        list.end_mesh_batch();
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
@@ -2191,6 +2200,7 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
+        list.end_mesh_batch();
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
@@ -2296,6 +2306,7 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
+        list.end_mesh_batch();
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
@@ -2441,12 +2452,34 @@ impl State {
             self.window = None;
         }
         let same = |w: &Window| w.copy == args.id() && w.kind == kind && w.stride == stride;
-        let hit = self
-            .window
-            .as_ref()
-            .filter(|w| same(w) && offset >= w.base)
-            .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
-            .map(|w| (w.scratch.clone(), offset - w.base));
+        let grouped = if windowed
+            && kind == MESH
+            && stride == crate::indirect::MESH_STRIDE
+            && grouped_mesh_clamp()
+            && offset.is_multiple_of(4)
+            && offset <= u64::from(u32::MAX - stride)
+        {
+            args.refresh(list, arguments, len);
+            list.clamp_mesh_argument(args.id(), &args.buffer, offset as u32)
+        } else {
+            None
+        };
+        let grouped_draw = grouped.is_some();
+        let hit = if let Some((bounded, at, opened)) = grouped {
+            self.window = None;
+            if opened {
+                self.host_pipeline = 0;
+                self.host_roots[1] = 0;
+            }
+            Some((bounded, at))
+        } else {
+            list.end_mesh_batch();
+            self.window
+                .as_ref()
+                .filter(|w| same(w) && offset >= w.base)
+                .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
+                .map(|w| (w.scratch.clone(), offset - w.base))
+        };
         let (bounded, at) = match hit {
             Some(hit) => hit,
             None => {
@@ -2521,7 +2554,9 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &bounded);
+            if !grouped_draw {
+                crate::indirect::done(list, &bounded);
+            }
             why("prepare failed");
             return false;
         }
@@ -2557,7 +2592,9 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
-        crate::indirect::done(list, &bounded);
+        if !grouped_draw {
+            crate::indirect::done(list, &bounded);
+        }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
