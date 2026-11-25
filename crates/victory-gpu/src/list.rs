@@ -1578,18 +1578,24 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
+        #[cfg(feature = "diagnostics")]
+        crate::callers::note(crate::callers::DRAW, vertices);
         with_state(this, |list, s| {
             s.draw(list, vertices, instances, first, first_instance)
         });
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
+        #[cfg(feature = "diagnostics")]
+        crate::callers::note(crate::callers::DISPATCH, x);
         with_state(this, |list, s| s.dispatch(list, x, y, z));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.
     pub(super) extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
         super::count_draw();
+        #[cfg(feature = "diagnostics")]
+        crate::callers::note(crate::callers::MESH, x);
         if y * z != 1 {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
@@ -1607,6 +1613,8 @@ mod state {
         _payload: u64,
     ) {
         super::count_draw();
+        #[cfg(feature = "diagnostics")]
+        crate::callers::note(crate::callers::MESH_X, x);
         if indirect != 0 {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
@@ -1623,6 +1631,8 @@ mod state {
         first_instance: u32,
     ) {
         super::count_draw();
+        #[cfg(feature = "diagnostics")]
+        crate::callers::note(crate::callers::INDEXED, indices);
         with_state(this, |list, s| {
             s.draw_indexed(list, indices, instances, first, base, first_instance)
         });
@@ -1687,6 +1697,8 @@ extern "system" fn execute_indirect(
     count_offset: u64,
 ) {
     count_draw();
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::callers::note(crate::callers::INDIRECT, max);
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
     };
