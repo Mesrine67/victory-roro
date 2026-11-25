@@ -45,6 +45,14 @@ Cross-references like "section 5.4" refer to the numbered headings in these file
 | [24-wine-proton-facts.md](docs/24-wine-proton-facts.md) | Wine/Proton/vkd3d-proton behaviours that changed our design. |
 | [25-open-questions.md](docs/25-open-questions.md) | What we still don't know. |
 
+## Deep dives (history, in detail)
+| Document | What it is |
+|---|---|
+| [30-pop-in-timeline.md](docs/30-pop-in-timeline.md) | The black/late texture investigation, dated step by step: every belief, change, measurement and lesson. |
+| [31-hitch-investigation-timeline.md](docs/31-hitch-investigation-timeline.md) | The frame-hitch investigation in the exact staging path: each hypothesis, instrument, result and review challenge. |
+| [32-device-loss-investigation.md](docs/32-device-loss-investigation.md) | The NVIDIA device-loss investigation: signature, crash tools, every fix tried, statistics pitfalls, current theory. |
+| [33-shared-core-findings.md](docs/33-shared-core-findings.md) | Lessons from several titles on one shared core: DMA/move engines, zlib on DMA, readbacks, descriptors, slabs, measurement pitfalls. |
+
 ## Tools
 [tools/](tools/): a Linux-side `/proc` sampler for Wine processes, a headless RGP capture reader and comparer, an event-triggered RGP capture watcher, and a slow-frame classifier. See [tools/README.md](tools/README.md).
 
