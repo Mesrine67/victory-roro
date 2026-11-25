@@ -71,6 +71,10 @@ pub(crate) struct Staging {
 struct Last {
     hash: Option<blake3::Hash>,
     asked: u64,
+    /// A refresh that only asked ([`refresh_all`]) found the texture is
+    /// to be read in place: what it had learnt of unseen writes, for the
+    /// read that follows with title memory held still.
+    waiting: Option<bool>,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
     /// The texture was found changed without a write the guard saw
@@ -648,15 +652,30 @@ impl Staging {
         preparing[3].fetch_add(read as u64, Relaxed);
     }
 
-    /// Returns the bytes of title memory read.
-    fn refresh_now(&self) -> usize {
+    /// The read a refresh that only asked left for later; the caller
+    /// holds title memory still. Returns the bytes read.
+    fn read_held(&self) -> usize {
         let whole = std::time::Instant::now();
-        let read = self.refresh_timed();
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(unseen) = last.waiting.take() else {
+            return 0;
+        };
+        let read = self.read_now(&mut last, self.size, unseen);
         REFRESH_WAITS[3].fetch_add(whole.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
         read
     }
 
-    fn refresh_timed(&self) -> usize {
+    /// Returns the bytes of title memory read.
+    fn refresh_now(&self) -> usize {
+        let whole = std::time::Instant::now();
+        let read = self.refresh_timed(false);
+        REFRESH_WAITS[3].fetch_add(whole.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        read
+    }
+
+    /// With `ask`, a texture that is to be read in place is not read:
+    /// `usize::MAX` comes back and [`read_held`](Self::read_held) reads it.
+    fn refresh_timed(&self, ask: bool) -> usize {
         let size = self.size;
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
@@ -715,6 +734,10 @@ impl Staging {
         // stays mapped (see `crate::watch::title_memory_reading`; without
         // it a page went between the asking and the read in runs 71 and
         // 74).
+        if ask {
+            last.waiting = Some(unseen);
+            return usize::MAX;
+        }
         let _mapped = if no_wait() {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
@@ -726,6 +749,13 @@ impl Staging {
         } else {
             waited(2, crate::watch::title_memory_reading)
         };
+        self.read_now(last, size, unseen)
+    }
+
+    /// The read of the texture's memory in place and what follows from
+    /// it. The caller holds title memory still
+    /// (`crate::watch::title_memory_reading`).
+    fn read_now(&self, last: &mut Last, size: usize, unseen: bool) -> usize {
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages
             // there, the usual state while it streams in. Read through the
@@ -1091,6 +1121,78 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         p = next;
     }
     there
+}
+
+/// Whether the texture refreshes of a list are done together at its
+/// submission (`VICTORY_TEXTURE_BATCH=0`: one by one, as before).
+pub(crate) fn batched() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_BATCH").is_none_or(|v| v != "0"))
+}
+
+/// Since the frame line last asked: batches that read in place, the
+/// textures they read, and the threads they used.
+pub(crate) static BATCHES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Brings `stagings` up to date ([`Staging::refresh`] for each), reading
+/// those that are read in place together: title memory is held still once
+/// for all of them, and they are hashed and detiled on several threads.
+///
+/// One by one, each waited for the runtime to finish a remapping, and in
+/// the opening cutscene the runtime remaps for most of every frame: 95% of
+/// the 400-1,800 ms a frame the texture step took was that wait (run
+/// `pool_try3`: 770.8 of 802.4 ms, 1,057.7 of 1,079.9). The read itself
+/// ran on the submitting thread alone.
+pub(crate) fn refresh_all(stagings: &[Arc<Staging>]) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if stagings.is_empty() {
+        return;
+    }
+    crate::zone!("texture refreshes");
+    let started = std::time::Instant::now();
+    let mut read = 0;
+    // What the write watch and the guards settle needs nothing held.
+    let mut waiting: Vec<&Staging> = Vec::new();
+    for staging in stagings {
+        let whole = std::time::Instant::now();
+        match staging.refresh_timed(true) {
+            usize::MAX => waiting.push(staging),
+            n => read += n,
+        }
+        REFRESH_WAITS[3].fetch_add(whole.elapsed().as_micros() as u64, Relaxed);
+    }
+    if !waiting.is_empty() {
+        let held = std::time::Instant::now();
+        let _mapped = waited(2, crate::watch::title_memory_reading);
+        // The wait is every texture's, as it was when each took the lock.
+        REFRESH_WAITS[3].fetch_add(held.elapsed().as_micros() as u64, Relaxed);
+        let spare = std::thread::available_parallelism().map_or(1, |n| n.get() / 2).clamp(1, 12);
+        let threads = waiting.len().div_ceil(4).min(spare);
+        BATCHES[0].fetch_add(1, Relaxed);
+        BATCHES[1].fetch_add(waiting.len() as u64, Relaxed);
+        BATCHES[2].fetch_add(threads as u64, Relaxed);
+        let total = std::sync::atomic::AtomicUsize::new(0);
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let work = || {
+            while let Some(staging) = waiting.get(next.fetch_add(1, Relaxed)) {
+                total.fetch_add(staging.read_held(), Relaxed);
+            }
+        };
+        if threads <= 1 {
+            work();
+        } else {
+            std::thread::scope(|scope| {
+                for _ in 1..threads {
+                    scope.spawn(work);
+                }
+                work();
+            });
+        }
+        read += total.load(Relaxed);
+    }
+    let preparing = &crate::host::PREPARING;
+    preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+    preparing[3].fetch_add(read as u64, Relaxed);
 }
 
 /// Whether staging memory is cut from big upload buffers
