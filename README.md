@@ -61,6 +61,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\play.ps1 -Game "D:\Games\G
 The path is remembered after the first run. `-SeriesX` runs as the larger console (about half the frame rate). Each run
 writes `logs\<date_time>\err.txt` (the runtime's log), `out.txt` and `run.txt`.
 
+**First launch after a build or an update:** `play.ps1` first translates the game's shaders into the cache
+(`victory.exe warm`, several minutes, shown in the console), then starts the game. Without it the loading screen stays
+black while every shader is translated and compiled in game. Pipelines that need the game's draw state are still
+compiled the first time they are drawn, so the very first load stays slower than later ones. `-NoWarm` skips the step,
+`-Warm` redoes it.
+
 ## Windows 10
 
 Windows 10's own Direct3D 12 stops at Shader Model 6.5, so every translated pipeline is refused and nothing draws.
