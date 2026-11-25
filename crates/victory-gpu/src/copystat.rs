@@ -127,6 +127,22 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// Write detection, split (microseconds, summed over the threads that
+    /// refresh): the host's `GetWriteWatch` calls that answered, and their
+    /// time; those it refused (memory that is not write-watched: views of
+    /// the page pool, which the guards then answer for), and their time;
+    /// askings answered from the journal, and their time; and of the
+    /// refreshes of watched copies: asking, walking the range's pages for
+    /// stale ones, and copying those.
+    KernelAsks,
+    KernelUs,
+    KernelRefused,
+    KernelRefusedUs,
+    JournalAnswers,
+    JournalUs,
+    AskUs,
+    WalkUs,
+    StaleCopyUs,
 }
 const COUNTERS: usize = 80;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -1111,6 +1127,22 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::PaceUs as usize]),
         c[C::GpuWritesLeftOut as usize],
         mb(c[C::GpuWritesLeftOutBytes as usize]),
+    );
+    tracing::info!(
+        "write detection per frame: GetWriteWatch answered {:.0} calls {:.2} ms, refused {:.0} calls {:.2} ms \
+         (not write-watched memory); guards {:.2} ms; journal answered {:.0} askings {:.2} ms; refreshes of \
+         watched copies: asking {:.2} ms, walking pages {:.2} ms, copying the stale ones {:.2} ms \
+         (threads summed)",
+        c[C::KernelAsks as usize],
+        ms(c[C::KernelUs as usize]),
+        c[C::KernelRefused as usize],
+        ms(c[C::KernelRefusedUs as usize]),
+        ms(c[C::GuardUs as usize]),
+        c[C::JournalAnswers as usize],
+        ms(c[C::JournalUs as usize]),
+        ms(c[C::AskUs as usize]),
+        ms(c[C::WalkUs as usize]),
+        ms(c[C::StaleCopyUs as usize]),
     );
     // Where the wall clock of a frame goes: the phases of a frame, the
     // processor time of the whole process, and what each submitting and

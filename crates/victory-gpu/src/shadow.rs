@@ -1319,6 +1319,13 @@ mod wide_tests {
 /// compared, changed runs put in, and their bytes.
 static MERGED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    /// Nanoseconds this thread spent copying stale pages inside the
+    /// [`Shadow::copy_stale`] under way (`Shadow::copy_timed`).
+    static STALE_COPY_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// [`MERGED`], taken.
 pub(crate) fn merged_stats() -> [u64; 3] {
     [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
@@ -2387,12 +2394,23 @@ impl Shadow {
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            #[cfg(feature = "diagnostics")]
+            let asking = std::time::Instant::now();
+            let asked = crate::watch::writes(from, to, true);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::AskUs, asking.elapsed().as_micros() as u64);
+            if let Some((now, written)) = asked {
                 self.watched.store(1, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                let (walking, outer) = (std::time::Instant::now(), STALE_COPY_NS.with(|ns| ns.replace(0)));
                 let copied = self.copy_stale(from, to, now, &written);
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
+                    // The walk is what the stale pages' copies leave of it.
+                    let copy_us = STALE_COPY_NS.with(|ns| ns.replace(outer)) / 1000;
+                    add(C::StaleCopyUs, copy_us);
+                    add(C::WalkUs, (walking.elapsed().as_micros() as u64).saturating_sub(copy_us));
                     add(C::Checked, (to - from) as u64);
                     add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
                 }
@@ -2437,13 +2455,24 @@ impl Shadow {
                 }
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {
-                bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                bytes += self.copy_timed((first * PAGE).max(from), (page * PAGE).min(to));
             }
         }
         // Cut to the range: next to it shaders may be writing the copy.
         if let Some(first) = run {
-            bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+            bytes += self.copy_timed((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
         }
+        bytes
+    }
+
+    /// [`Shadow::copy`] for [`Shadow::copy_stale`], its time noted for the
+    /// write-detection line (which tells walking pages from copying them).
+    fn copy_timed(&self, from: usize, to: usize) -> usize {
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        let bytes = self.copy(from, to);
+        #[cfg(feature = "diagnostics")]
+        STALE_COPY_NS.with(|ns| ns.set(ns.get() + started.elapsed().as_nanos() as u64));
         bytes
     }
 

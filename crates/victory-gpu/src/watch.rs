@@ -127,6 +127,16 @@ fn slow(us: u64) {
     SLOW[2].fetch_max(us, Relaxed);
 }
 
+/// One `GetWriteWatch` call and its microseconds: answered, or refused
+/// (memory that is not write-watched).
+#[cfg(feature = "diagnostics")]
+fn kernel_asked(refused: bool, us: u64) {
+    use crate::copystat::{C, add};
+    let (calls, time) = if refused { (C::KernelRefused, C::KernelRefusedUs) } else { (C::KernelAsks, C::KernelUs) };
+    add(calls, 1);
+    add(time, us);
+}
+
 /// [`SLOW`], taken.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn slow_asks() -> [u64; 3] {
@@ -263,6 +273,8 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
             &mut granularity,
         )
     } != 0;
+    #[cfg(feature = "diagnostics")]
+    kernel_asked(failed, started.elapsed().as_micros() as u64);
     if failed {
         return false;
     }
@@ -304,17 +316,26 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    #[cfg(feature = "diagnostics")]
+    let entered = std::time::Instant::now();
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
-        return Some((
+        let answer = Some((
             j.ahead_asked,
             j.written
                 .range(first..last)
                 .map(|(&p, &w)| (p, w))
                 .collect(),
         ));
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::JournalAnswers, 1);
+            add(C::JournalUs, entered.elapsed().as_micros() as u64);
+        }
+        return answer;
     }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
@@ -332,6 +353,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             &mut granularity,
         )
     } != 0;
+    #[cfg(feature = "diagnostics")]
+    kernel_asked(failed, started.elapsed().as_micros() as u64);
     let guarded = if failed {
         count = 0;
         if !guarded {

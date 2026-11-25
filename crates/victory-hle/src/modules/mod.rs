@@ -35,6 +35,8 @@ pub mod xgameruntime;
 pub mod xgamesave;
 pub mod xgameui;
 #[cfg(windows)]
+pub mod vmem;
+#[cfg(windows)]
 pub mod xmem;
 pub mod xnetworking;
 pub mod xpackage;
@@ -66,6 +68,8 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(lifecycle::module());
     #[cfg(windows)]
     all.push(net::module());
+    #[cfg(windows)]
+    all.push(vmem::module());
     #[cfg(windows)]
     all.push(xmem::module());
     #[cfg(windows)]
