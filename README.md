@@ -52,6 +52,7 @@ Cross-references like "section 5.4" refer to the numbered headings in these file
 | [31-hitch-investigation-timeline.md](docs/31-hitch-investigation-timeline.md) | The frame-hitch investigation in the exact staging path: each hypothesis, instrument, result and review challenge. |
 | [32-device-loss-investigation.md](docs/32-device-loss-investigation.md) | The NVIDIA device-loss investigation: signature, crash tools, every fix tried, statistics pitfalls, current theory. |
 | [33-shared-core-findings.md](docs/33-shared-core-findings.md) | Lessons from several titles on one shared core: DMA/move engines, zlib on DMA, readbacks, descriptors, slabs, measurement pitfalls. |
+| [36-switch-survey-and-threading.md](docs/36-switch-survey-and-threading.md) | What every runtime knob taught us, by subsystem, plus the texture threading study (what was rejected and why). |
 
 ## Tools
 [tools/](tools/): a Linux-side `/proc` sampler for Wine processes, a headless RGP capture reader and comparer, an event-triggered RGP capture watcher, and a slow-frame classifier. See [tools/README.md](tools/README.md).
