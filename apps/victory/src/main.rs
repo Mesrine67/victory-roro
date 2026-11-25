@@ -121,7 +121,7 @@ enum Command {
         /// Seconds between saves of the pipeline library.
         #[arg(long, default_value_t = 300)]
         save_every: u64,
-        /// Diagnostics: write the hash and size of every shader container
+        /// Diagnostics: write the hash, size and name of every shader container
         /// in the title's files to this file, and stop.
         #[arg(long)]
         list_shaders: Option<PathBuf>,

@@ -26,7 +26,7 @@ use anyhow::{Context, Result, bail};
 use victory_hle::modules::d3d12x::{self, Created, Precompiled};
 use victory_shader::Container;
 
-use crate::shader::{MAX_FILE, sources};
+use crate::shader::{MAX_FILE, Source, sources};
 
 pub struct Options {
     /// Where the title's shaders are looked for (default: the game folder).
@@ -94,7 +94,14 @@ fn rank(path: &Path) -> u8 {
 /// The shader containers in the files under `paths`: those in `wanted`, or
 /// all of them. As `victory warm` finds them: packed records and plain
 /// containers, cut to the container's own size as the title passes it.
-fn scan(paths: &[PathBuf], wanted: Option<&HashSet<[u8; 8]>>, threads: usize) -> Containers {
+/// `names` takes the names packed records carry (the title's own, like
+/// `smh_sim_0:CS_InitSimBuffer_de9d2ad2_Wrapped`), for reading logs.
+fn scan(
+    paths: &[PathBuf],
+    wanted: Option<&HashSet<[u8; 8]>>,
+    threads: usize,
+    names: Option<&Mutex<HashMap<[u8; 8], String>>>,
+) -> Containers {
     let mut files = Vec::new();
     let mut large = Vec::new();
     for root in paths {
@@ -145,6 +152,11 @@ fn scan(paths: &[PathBuf], wanted: Option<&HashSet<[u8; 8]>>, threads: usize) ->
                         let id: [u8; 8] = hash.as_bytes()[..8].try_into().expect("8 of 32 bytes");
                         if wanted.is_some_and(|w| !w.contains(&id)) {
                             continue;
+                        }
+                        if let (Some(names), Source::Packed(record)) = (names, job)
+                            && let Some(name) = record.name
+                        {
+                            lock(names).entry(id).or_insert_with(|| name.to_owned());
                         }
                         lock(&found).entry(id).or_insert_with(|| Arc::from(bytes));
                     }
@@ -207,10 +219,16 @@ pub fn run(o: Options) -> Result<()> {
         .max(1);
     if let Some(file) = &o.list_shaders {
         let paths = crate::default_paths(o.paths)?;
-        let found = scan(&paths, None, threads);
+        let names = Mutex::new(HashMap::new());
+        let found = scan(&paths, None, threads, Some(&names));
+        let names = lock(&names);
+        // Id, size, and the title's name for it where its record has one.
         let mut lines: Vec<String> = found
             .iter()
-            .map(|(id, bytes)| format!("{} {}", id.iter().map(|b| format!("{b:02x}")).collect::<String>(), bytes.len()))
+            .map(|(id, bytes)| {
+                let hex = id.iter().map(|b| format!("{b:02x}")).collect::<String>();
+                format!("{hex} {} {}", bytes.len(), names.get(id).map_or("?", String::as_str))
+            })
             .collect();
         lines.sort();
         std::fs::write(file, lines.join("\n") + "\n").with_context(|| format!("writing {}", file.display()))?;
@@ -290,7 +308,7 @@ pub fn run(o: Options) -> Result<()> {
         o.limit.map_or(String::new(), |l| format!(", at most {l} (--limit)"))
     );
     let paths = crate::default_paths(o.paths)?;
-    let containers = scan(&paths, Some(&wanted), threads);
+    let containers = scan(&paths, Some(&wanted), threads, None);
     let without = work
         .iter()
         .filter(|(p, _)| p.shaders.iter().any(|s| !containers.contains_key(&s.1)))
