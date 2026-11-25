@@ -128,6 +128,7 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
 /// host copies of textures the title fills).
 /// `VICTORY_SWEEP=0` keeps everything, as before.
 fn sweep() {
+    crate::zone!("sweep");
     // The in-place probe and census, if asked for (`VICTORY_INPLACE_PROBE`).
     crate::inplace::tick();
     static ON: OnceLock<bool> = OnceLock::new();
@@ -2365,6 +2366,7 @@ fn late_threads() {
 /// as waiting for the card. The caller may hold the submission lock: the
 /// thread that lands flights never takes it.
 fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
+    crate::zone!("relay wait");
     let mut line = line();
     if done(&line) {
         return;
@@ -2680,6 +2682,7 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
 /// The ranges the shaders of `runs` may write, per host copy, as declared.
 /// One list's lock at a time: a submission may name a list twice.
 fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
+    crate::zone!("declared writes");
     let mut back: Vec<Declared> = Vec::new();
     for list in runs {
         for step in &list.deferred().copies {
@@ -3936,7 +3939,10 @@ impl Host {
         crate::copystat::submission_begins();
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
-        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let mut submitted = {
+            crate::zone!("submission lock");
+            self.submitted.lock().unwrap_or_else(|e| e.into_inner())
+        };
         let was_working = working(true);
         submitting(1, runs.len());
         // Flights in the air ([`late`]): a submission that is waited for
@@ -4059,9 +4065,13 @@ impl Host {
         if late {
             *submitted += 1;
             // SAFETY: closed lists; the fence is ours.
-            let signalled = unsafe {
-                self.queue.ExecuteCommandLists(&lists);
-                self.queue.Signal(&self.fence, *submitted)
+            let signalled = {
+                crate::zone!("host ExecuteCommandLists");
+                // SAFETY: closed lists of this queue's kind, and its fence.
+                unsafe {
+                    self.queue.ExecuteCommandLists(&lists);
+                    self.queue.Signal(&self.fence, *submitted)
+                }
             };
             self.card_sent();
             if let Err(e) = signalled {

@@ -1056,6 +1056,7 @@ static SNAPS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
 /// its lists go to the card: takes the snapshots [`Shadow::writing`] noted.
 /// Nothing to do without the switch.
 pub(crate) fn take_snapshots() {
+    crate::zone!("take snapshots");
     let snaps = std::mem::take(&mut *SNAPS.lock().unwrap_or_else(|e| e.into_inner()));
     if snaps.is_empty() {
         return;
@@ -2786,6 +2787,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// against 120 MB, 7,087 write-watch askings against 2,600, and 5,263
 /// windows (4.5 GB) let go in two minutes against 393 in a whole run.
 pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    crate::zone!("find title buffer");
     // With whole windows (the default) there is one window to a cell and
     // nothing to choose: exactly `find`.
     if !fine() {

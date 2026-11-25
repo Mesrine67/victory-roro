@@ -784,6 +784,7 @@ impl State {
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+        crate::zone!("draw prepare");
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
@@ -879,6 +880,7 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        crate::zone!("bind");
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -2541,6 +2543,7 @@ impl State {
                 }
                 list.list.SetComputeRoot32BitConstant(*param, 0, *dword);
             } else {
+                crate::zone!("host ExecuteIndirect");
                 list.list.ExecuteIndirect(
                     &signature,
                     max,
