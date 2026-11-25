@@ -1,8 +1,9 @@
 //! Which title code records the draws (`VICTORY_DRAW_CALLERS=1`,
 //! diagnostics builds). Every draw-kind call of a command list notes the
 //! return addresses above it; about every 20 seconds the stacks seen since
-//! are logged, most frequent first, as `module+rva` (the title's image as
-//! `title`, our own frames left out). The rvas are what a disassembler is
+//! are logged, most frequent first, as `module+rva` (the title's images as
+//! `img` and four digits, our own frames left out). The rvas are what a
+//! disassembler is
 //! pointed at to find the title's submission loop and what decides, above
 //! it, which meshes are drawn. Costs a stack walk per draw: for looking, not
 //! for timing.
@@ -23,7 +24,22 @@ pub(crate) const MESH: u8 = 2;
 pub(crate) const MESH_X: u8 = 3;
 pub(crate) const INDIRECT: u8 = 4;
 pub(crate) const DISPATCH: u8 = 5;
-const KINDS: [&str; 6] = ["draw", "indexed", "mesh", "mesh x", "indirect", "dispatch"];
+const INDIRECT_DRAW: u8 = 6;
+const INDIRECT_INDEXED: u8 = 7;
+const INDIRECT_DISPATCH: u8 = 8;
+const INDIRECT_MESH: u8 = 9;
+const KINDS: [&str; 10] = [
+    "draw",
+    "indexed",
+    "mesh",
+    "mesh x",
+    "indirect",
+    "dispatch",
+    "indirect draw",
+    "indirect indexed",
+    "indirect dispatch",
+    "indirect mesh",
+];
 
 fn on() -> bool {
     static ON: LazyLock<bool> =
@@ -31,8 +47,9 @@ fn on() -> bool {
     *ON
 }
 
-/// Calls and the sum of their amounts, by kind and stack.
-type Seen = HashMap<(u8, [usize; DEPTH]), (u64, u64)>;
+/// Calls, the sum of their amounts and how many asked for nothing, by kind
+/// and stack.
+type Seen = HashMap<(u8, [usize; DEPTH]), (u64, u64, u64)>;
 static SEEN: LazyLock<Mutex<Seen>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
@@ -61,6 +78,42 @@ pub(crate) fn note(kind: u8, amount: u32) {
     let entry = seen.entry((kind, key)).or_default();
     entry.0 += 1;
     entry.1 += u64::from(amount);
+    entry.2 += u64::from(amount == 0);
+}
+
+/// An indirect execution of one record kind (`kind`: the console's argument
+/// type; `max` records at most). Its amount is the first word of the first
+/// record as title memory holds it now (vertices, indices or groups in x),
+/// so a record that asks for nothing is seen; what a shader writes there
+/// later is not. Without readable arguments the amount is `max`.
+pub(crate) fn note_indirect(kind: Option<u32>, arguments: Option<u64>, max: u32) {
+    if !on() {
+        return;
+    }
+    let kind_of = match kind {
+        Some(0) => INDIRECT_DRAW,
+        Some(1) => INDIRECT_INDEXED,
+        Some(2 | 105) => INDIRECT_DISPATCH,
+        Some(10) => INDIRECT_MESH,
+        _ => INDIRECT,
+    };
+    let first = arguments.and_then(|at| {
+        let mut word = 0u32;
+        let mut read = 0usize;
+        // SAFETY: reads four bytes of our own process into `word`; memory
+        // that is not there fails the call instead of faulting.
+        let ok = unsafe {
+            windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory(
+                windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                at as *const core::ffi::c_void,
+                (&raw mut word).cast(),
+                4,
+                &mut read,
+            )
+        };
+        (ok != 0 && read == 4).then_some(word)
+    });
+    note(if first.is_some() { kind_of } else { INDIRECT }, first.unwrap_or(max));
 }
 
 /// A frame was presented: about every 20 seconds, logs what was noted since.
@@ -85,8 +138,24 @@ pub(crate) fn presented() {
     let frames = FRAMES.swap(0, Relaxed).max(1) as f64;
     let seen = std::mem::take(&mut *SEEN.lock().unwrap_or_else(|e| e.into_inner()));
     let calls: u64 = seen.values().map(|v| v.0).sum();
+    // By kind: calls, amounts, calls that asked for nothing.
+    let mut kinds = [(0u64, 0u64, 0u64); KINDS.len()];
+    for ((kind, _), v) in &seen {
+        let k = &mut kinds[usize::from(*kind)];
+        (k.0, k.1, k.2) = (k.0 + v.0, k.1 + v.1, k.2 + v.2);
+    }
+    for (name, (n, amount, none)) in KINDS.iter().zip(kinds) {
+        if n != 0 {
+            tracing::info!(
+                "draw callers: {name}: {:.0} calls a frame, {:.0} of them asking for nothing when recorded, {:.0} asked in all a frame",
+                n as f64 / frames,
+                none as f64 / frames,
+                amount as f64 / frames
+            );
+        }
+    }
     let mut stacks: Vec<_> = seen.into_iter().collect();
-    stacks.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
+    stacks.sort_by_key(|(_, (n, _, _))| std::cmp::Reverse(*n));
     tracing::info!(
         "draw callers: {:.0} calls a frame over {frames:.0} frames, {} different stacks; the {} most frequent follow",
         calls as f64 / frames,
@@ -94,23 +163,24 @@ pub(crate) fn presented() {
         stacks.len().min(SAID)
     );
     let mut names: HashMap<usize, Option<String>> = HashMap::new();
-    for ((kind, key), (n, amount)) in stacks.into_iter().take(SAID) {
+    for ((kind, key), (n, amount, none)) in stacks.into_iter().take(SAID) {
         let named: Vec<String> = key
             .iter()
             .take_while(|a| **a != 0)
             .filter_map(|a| names.entry(*a).or_insert_with(|| name(*a)).clone())
             .collect();
         tracing::info!(
-            "draw callers: {:.2} a frame, {} (amount {:.0} each) from {}",
+            "draw callers: {:.2} a frame, {} (amount {:.0} each, {:.2} a frame asking for nothing) from {}",
             n as f64 / frames,
             KINDS[usize::from(kind)],
             amount as f64 / n as f64,
+            none as f64 / frames,
             named.join(" < ")
         );
     }
 }
 
-/// `module+rva` of a return address; `title+rva` in the title's image; none
+/// `module+rva` of a return address; `img<hash>+rva` in a title image; none
 /// for our own code.
 fn name(address: usize) -> Option<String> {
     use windows_sys::Win32::System::LibraryLoader::{
@@ -138,6 +208,12 @@ fn name(address: usize) -> Option<String> {
     let len = unsafe { GetModuleFileNameW(module, path.as_mut_ptr(), path.len() as u32) };
     let path = String::from_utf16_lossy(&path[..len as usize]);
     let file = path.rsplit('\\').next().unwrap_or(&path);
-    let module_name = if file.to_ascii_lowercase().ends_with(".exe") { "title" } else { file };
+    // The loader maps the title's images from prepared copies named
+    // `victory-image-<hash>.dll` (same layout as the title's files): `img`
+    // and the hash's first four digits, which tell the game from its DLLs.
+    let module_name = match file.strip_prefix("victory-image-") {
+        Some(hash) => format!("img{}", hash.get(..4).unwrap_or(hash)),
+        None => file.to_owned(),
+    };
     Some(format!("{module_name}+{:#x}", address - module as usize))
 }

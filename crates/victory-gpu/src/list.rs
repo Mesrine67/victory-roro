@@ -1697,12 +1697,14 @@ extern "system" fn execute_indirect(
     count_offset: u64,
 ) {
     count_draw();
-    #[cfg(all(windows, feature = "diagnostics"))]
-    crate::callers::note(crate::callers::INDIRECT, max);
     let Some((stride, args)) = crate::signature::layout(signature) else {
+        #[cfg(all(windows, feature = "diagnostics"))]
+        crate::callers::note(crate::callers::INDIRECT, max);
         return;
     };
     let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::callers::note_indirect(args.first().map(|a| a[0]), address, max);
     let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
     let mut ran = false;
     #[cfg(windows)]
