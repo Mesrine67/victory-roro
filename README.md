@@ -9,7 +9,7 @@ It covers how we bridged the console's unified CPU/GPU memory to PC heaps and GP
 ## Start here
 - **The whole write-up as one page:** [xbox-memory-translation-notes](https://github.com/TPepperoni666/xbox-memory-translation-notes).
 - **The short version:** [docs/00-about.md](docs/00-about.md), section 0.4 ("Short version").
-- **If you are starting a Series X translator:** read [14-series-x.md](docs/14-series-x.md) and [15-day-one.md](docs/15-day-one.md), then come back to the mechanisms.
+- **If you are starting a Series X translator:** read [14-series-x.md](docs/14-series-x.md), the deeper public research in [39-series-x-public-research.md](docs/39-series-x-public-research.md), and [15-day-one.md](docs/15-day-one.md), then come back to the mechanisms.
 
 ## The write-up (one topic per file)
 | # | Topic |
@@ -57,6 +57,7 @@ Cross-references like "section 5.4" refer to the numbered headings in these file
 | [36-switch-survey-and-threading.md](docs/36-switch-survey-and-threading.md) | What every runtime knob taught us, by subsystem, plus the texture threading study (what was rejected and why). |
 | [37-optimisation-passes-and-handheld.md](docs/37-optimisation-passes-and-handheld.md) | The optimisation passes that cut the exact path's CPU cost, with per-machine numbers, and running on a 15-25 W handheld: power, hybrid cores, priority, pacing, how a switch earned default-on. |
 | [38-pipelines-shader-caches-load-times.md](docs/38-pipelines-shader-caches-load-times.md) | Pipeline (PSO) creation in a translator: cache layers, pre-building without recording play, what failed, load-time and hitch numbers. |
+| [39-series-x-public-research.md](docs/39-series-x-public-research.md) | Series X|S from public sources only: memory pools, Velocity Architecture, DirectStorage/BCPack, sampler feedback and tiled resources on vkd3d-proton, DX12 Ultimate, with every link checked. |
 
 ## Tools
 [tools/](tools/): a Linux-side `/proc` sampler for Wine processes, a headless RGP capture reader and comparer, an event-triggered RGP capture watcher, and a slow-frame classifier. See [tools/README.md](tools/README.md).

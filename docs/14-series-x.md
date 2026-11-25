@@ -2,6 +2,8 @@
 
 We have not translated a Series X title. This section combines what we learned with Microsoft's *public* descriptions of the Series X|S platform, from its 2020 announcements and architecture talks and the public DirectX 12 Ultimate and DirectStorage documentation. Verify every point against your own title.
 
+> Deeper, source-by-source public research is in [39-series-x-public-research.md](39-series-x-public-research.md).
+
 ## 14.1 Platform differences that matter for memory (public information)
 - **No ESRAM.** The Series X has 16 GB of GDDR6, described publicly as 10 GB of faster "GPU-optimal" memory and 6 GB of slower "standard" memory, still one unified address space. Expect the title to *place* GPU-heavy resources in the fast range. The PC does not care, but address ranges and reservation patterns will differ from the Xbox One's, so your startup holds (section 2.1) need the title's real ranges.
 - **More memory, more objects.** Every per-span, per-page and per-slot structure we built grew with memory size. Design them O(change) from the start. Our registry walks became visible at about 111,000 spans and about 22,000 textures.
