@@ -69,10 +69,15 @@ pub(crate) fn probe_level() -> u8 {
 /// is a buffer placed over it ([`place_for`]). 2: title buffers too,
 /// except the big ones in the card's memory.
 ///
-/// What stage 1 covers is private memory (`XMemVirtualAlloc`'s). View
-/// memory (the page pool) is turned down here: its section is made
-/// reserved, which the host refuses, and what a view shows changes when
-/// the title maps pages.
+/// What it covers: private memory (`XMemVirtualAlloc`'s), by a heap opened
+/// on a part of the allocation; and view memory (the page pool) where the
+/// range is one run of the pool's section, by a buffer placed at the run's
+/// offset in one heap opened on the whole section ([`place_run`]). The
+/// pool needs `VICTORY_POOL_COMMIT=1` as well: its section is made
+/// reserved otherwise, which the host refuses. View memory in pieces
+/// (scattered pages, or pages not mapped) is copied as before. When the
+/// title maps other pages there, what is in place over them is let go
+/// ([`title_memory_freeing`]) and the next ask places or copies anew.
 ///
 /// What it assumes, for 2: nothing reads title memory that a submission
 /// not yet run writes through such a buffer. With every submission waited
@@ -131,6 +136,73 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
     Ok(Placed { buffer, heap, gpu, bias: start - at })
 }
 
+/// Since the start: placements made in the page pool's section (view
+/// memory that is one run of it) and their bytes; sections opened as a
+/// heap, and sections the host refused or that were made reserved.
+static POOL: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// The heaps opened on the title's page-pool sections, by the section's
+/// handle: each opened once, at the first placement in it, and kept (the
+/// heap is the section itself, whatever its views do). `None` for one that
+/// cannot be opened (made reserved, or the host refused): not asked again.
+static SECTION_HEAPS: Mutex<Vec<(usize, Option<ID3D12Heap>)>> = Mutex::new(Vec::new());
+
+/// The heap on `section`, opened at the first call. `Err` with nothing if
+/// the section was made reserved (run with `VICTORY_POOL_COMMIT=1`) or was
+/// refused before; with the host's error the one time it refuses.
+fn section_heap(device: &ID3D12Device, section: usize) -> Result<ID3D12Heap, Option<windows::core::Error>> {
+    let mut heaps = SECTION_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, heap)) = heaps.iter().find(|h| h.0 == section) {
+        return heap.clone().ok_or(None);
+    }
+    let known = views().sections.iter().find(|s| s.0 == section).map(|s| (s.1, s.2));
+    let Some((bytes, true)) = known else {
+        POOL[3].fetch_add(1, Ordering::Relaxed);
+        heaps.push((section, None));
+        return Err(None);
+    };
+    let (set, started) = (working_set_mb(), std::time::Instant::now());
+    match open(device, From::Section(section)) {
+        Ok(heap) => {
+            POOL[2].fetch_add(1, Ordering::Relaxed);
+            tracing::info!(
+                "title memory in place: the page pool's section of {} MB opened as one heap in {:.1} ms (working set {set} -> {} MB); {}",
+                bytes >> 20,
+                started.elapsed().as_secs_f64() * 1000.0,
+                working_set_mb(),
+                describe(&heap)
+            );
+            heaps.push((section, Some(heap.clone())));
+            Ok(heap)
+        }
+        Err(e) => {
+            POOL[3].fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(mb = bytes >> 20, error = %e, "title memory in place: the page pool's section was refused as a heap; its views are copied as before");
+            heaps.push((section, None));
+            Err(Some(e))
+        }
+    }
+}
+
+/// View memory `[start, start + len)` that is one run of `section`, with
+/// `offset` the place of `start` in it: one buffer placed over its 64 KiB
+/// pages in the section's heap. Views begin on 64 KiB lines of both the
+/// address and the section, so the pages that hold the range are one run
+/// too. `Err` as [`section_heap`].
+pub(crate) fn place_run(device: &ID3D12Device, section: usize, offset: u64, start: u64, len: u64) -> Result<Placed, Option<windows::core::Error>> {
+    let at = start & !(K64 as u64 - 1);
+    let bias = start - at;
+    let bytes = (start + len.max(1)).next_multiple_of(K64 as u64) - at;
+    let Some(from) = offset.checked_sub(bias).filter(|from| from % K64 as u64 == 0) else {
+        return Err(None);
+    };
+    let heap = section_heap(device, section)?;
+    let buffer = place(device, &heap, from, bytes).map_err(Some)?;
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() } + bias;
+    Ok(Placed { buffer, heap, gpu, bias })
+}
+
 /// Title memory `[start, start + len)` in place, for a window outside
 /// buffers or a title buffer, if [`level`] asks for it and the memory can
 /// be opened; `None` leaves the caller to make a copy, as before.
@@ -138,21 +210,35 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if level() < if window { 1 } else { 2 } {
         return None;
     }
-    // View memory: known from the runtime without asking Windows.
-    if cover(start as usize, len as usize) != Cover::None {
-        STATS[4].fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
+    // View memory: known from the runtime without asking Windows. One run
+    // of a section can be shown by one buffer placed in the section's heap
+    // (`place_run`); anything else of the pool is copied as before.
+    let run = match cover(start as usize, len as usize) {
+        Cover::None => None,
+        Cover::Run(section, offset) => Some((section, offset)),
+        Cover::Holes | Cover::Scattered => {
+            STATS[4].fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+    };
     if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
         STATS[6].fetch_add(1, Ordering::Relaxed);
         return None;
     }
     let host = crate::host::host()?;
-    match place_part(&host.device, start, len) {
+    let placed = match run {
+        Some((section, offset)) => place_run(&host.device, section, offset, start, len),
+        None => place_part(&host.device, start, len),
+    };
+    match placed {
         Ok(placed) => {
             let at = if window { 0 } else { 2 };
             STATS[at].fetch_add(1, Ordering::Relaxed);
             STATS[at + 1].fetch_add(len, Ordering::Relaxed);
+            if run.is_some() {
+                POOL[0].fetch_add(1, Ordering::Relaxed);
+                POOL[1].fetch_add(len, Ordering::Relaxed);
+            }
             Some(placed)
         }
         Err(None) => {
@@ -199,8 +285,9 @@ fn say() {
     }
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
     tracing::info!(
-        "title memory in place: {} windows {} MB, {} title buffers {} MB (no copy, no refresh, no copy-back); turned down: {} view memory or not private memory committed whole, \
-         {} refused by the host, {} over VICTORY_INPLACE_MB; {} let go because their memory changed",
+        "title memory in place: {} windows {} MB, {} title buffers {} MB (no copy, no refresh, no copy-back); turned down: {} view memory in pieces or not private memory committed whole, \
+         {} refused by the host, {} over VICTORY_INPLACE_MB; {} let go because their memory changed; in the page pool since the start: {} placements {} MB, \
+         {} sections opened as heaps, {} not opened (reserved without VICTORY_POOL_COMMIT=1, or refused)",
         s[0],
         s[1] >> 20,
         s[2],
@@ -208,7 +295,11 @@ fn say() {
         s[4],
         s[5],
         s[6],
-        s[7]
+        s[7],
+        POOL[0].load(Ordering::Relaxed),
+        POOL[1].load(Ordering::Relaxed) >> 20,
+        POOL[2].load(Ordering::Relaxed),
+        POOL[3].load(Ordering::Relaxed)
     );
 }
 
@@ -1145,6 +1236,59 @@ mod tests {
             assert_ne!(mem::VirtualFree(base.add(2 * K64).cast(), K64, mem::MEM_DECOMMIT), 0);
             assert!(matches!(place_part(&device, start, len), Err(None)));
             mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
+        }
+    }
+
+    /// The page pool's path on the software adapter: a committed section,
+    /// a view of some of its pages told as the runtime tells it, and a
+    /// range inside the view placed in the section's heap. The GPU reads
+    /// the view's bytes at the title's address and its write lands there;
+    /// a second placement takes the heap opened by the first; a section
+    /// made reserved is turned down without asking the host again.
+    #[test]
+    fn warp_view_memory_in_place_is_a_buffer_in_the_sections_heap() {
+        let Some(device) = warp() else { return };
+        const SIZE: usize = 32 * K64;
+        // SAFETY: a section, a placeholder and views of the test's own.
+        unsafe {
+            let process = windows_sys::Win32::System::Threading::GetCurrentProcess();
+            let invalid = windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+            let handle = mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, 0, SIZE as u32, std::ptr::null());
+            let hole = mem::VirtualAlloc2(process, std::ptr::null(), 8 * K64, mem::MEM_RESERVE | mem::MEM_RESERVE_PLACEHOLDER, mem::PAGE_NOACCESS, std::ptr::null_mut(), 0).cast::<u8>();
+            assert!(!handle.is_null() && !hole.is_null());
+            // Pages 12..20 of the section at the placeholder.
+            let view = mem::MapViewOfFile3(handle, process, hole.cast(), (12 * K64) as u64, 8 * K64, mem::MEM_REPLACE_PLACEHOLDER, mem::PAGE_READWRITE, std::ptr::null_mut(), 0);
+            assert_eq!(view.Value.cast::<u8>(), hole);
+            title_memory_section(handle as usize, SIZE as u64, true);
+            title_memory_view(hole as usize, 8 * K64, handle as usize, (12 * K64) as u64);
+            // A range that begins and ends off the 64 KiB lines.
+            let (start, len) = (hole as u64 + 2 * K64 as u64 + 0x2340, 3 * K64 as u64 + 9);
+            let Cover::Run(section, offset) = cover(start as usize, len as usize) else { panic!("one run of the section") };
+            assert_eq!((section, offset), (handle as usize, 14 * K64 as u64 + 0x2340));
+            let placed = place_run(&device, section, offset, start, len).unwrap_or_else(|e| panic!("not placed: {e:?}"));
+            assert_eq!(placed.bias, 0x2340);
+            assert_eq!(placed.gpu, placed.buffer.GetGPUVirtualAddress() + 0x2340);
+            assert_eq!(placed.buffer.GetDesc().Width, 4 * K64 as u64, "the pages that hold the range");
+            let mut rig = Rig::new(&device).unwrap();
+            fill(start as *mut u8, len as usize, 11);
+            let got = rig.fetch(&placed.buffer, placed.bias, len as usize).unwrap();
+            assert!(same(start as *const u8, &got), "the GPU reads the view's bytes at the title's address");
+            rig.store(&placed.buffer, placed.bias + 32, &[0x3c; 64]).unwrap();
+            assert!(same((start + 32) as *const u8, &[0x3c; 64]), "the GPU's write is at the title's address");
+            // Another range of the same section: the same heap, opened once.
+            let other = place_run(&device, section, 12 * K64 as u64, hole as u64, K64 as u64).unwrap_or_else(|e| panic!("not placed: {e:?}"));
+            assert_eq!(other.heap, placed.heap);
+            fill(hole, K64, 5);
+            assert!(rig.fetch(&other.buffer, 0, K64).is_ok_and(|got| same(hole, &got)));
+            drop((placed, other));
+            // A reserved section: turned down, and remembered as such.
+            let reserved = mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_RESERVE, 0, SIZE as u32, std::ptr::null());
+            title_memory_section(reserved as usize, SIZE as u64, false);
+            assert!(matches!(place_run(&device, reserved as usize, 0, hole as u64, K64 as u64), Err(None)));
+            views_gone(hole as usize, 8 * K64);
+            mem::UnmapViewOfFile2(process, view, 0);
+            windows_sys::Win32::Foundation::CloseHandle(handle);
+            windows_sys::Win32::Foundation::CloseHandle(reserved);
         }
     }
 

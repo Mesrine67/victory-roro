@@ -47,6 +47,19 @@ pub(crate) fn on_wine() -> bool {
     *WINE
 }
 
+/// Whether the sections behind physical pages are made committed whole
+/// (`SEC_COMMIT`) instead of reserved and committed page by page: always
+/// under Wine, and with `VICTORY_POOL_COMMIT=1`. Only a committed section
+/// can be opened as a host heap, which is what lets the card read the
+/// title's page pool where it lies (`victory_gpu`'s `inplace`, with
+/// `VICTORY_INPLACE`). The price is the whole pool charged against the
+/// PC's commit limit at once (6.1 GiB for this title): off by default.
+pub(crate) fn sections_committed() -> bool {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| on_wine() || std::env::var_os("VICTORY_POOL_COMMIT").is_some_and(|v| v == "1"));
+    *ON
+}
+
 /// Standard memory the title has handed to the system.
 static TRANSFERRED: AtomicUsize = AtomicUsize::new(0);
 
@@ -419,7 +432,9 @@ pub extern "system" fn XMemAllocatePhysicalPages(
             // touched, and committing a reserved one page by page costs a
             // wineserver request each that scans every range committed so
             // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
+            // With `VICTORY_POOL_COMMIT=1` too, so that the host can open
+            // the section as a heap (`sections_committed`).
+            PAGE_READWRITE | if sections_committed() { SEC_COMMIT } else { SEC_RESERVE },
             (size as u64 >> 32) as u32,
             size as u32,
             std::ptr::null(),
@@ -437,9 +452,15 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
+    if sections_committed() && !on_wine() {
+        tracing::info!(
+            mb = size >> 20,
+            "physical pages: the section is committed whole (VICTORY_POOL_COMMIT=1), so the host can open it as a heap"
+        );
+    }
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
+    victory_gpu::title_memory_section(handle as usize, size as u64, sections_committed());
     let section = Arc::new(Section(handle));
     let mut physical = physical();
     let first = physical.next_page;
@@ -786,8 +807,8 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
 
 /// Commits the section pages a view shows (once per page, whichever view).
 fn commit(base: usize, len: usize) -> bool {
-    if on_wine() {
-        return true; // sections are committed whole there
+    if sections_committed() {
+        return true; // committed whole when the section was made
     }
     // SAFETY: `[base, base + len)` is a view of a reserved section.
     if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
